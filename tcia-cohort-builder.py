@@ -43,7 +43,7 @@ def calculate_age_at_baseline(df, age_columns=['Age at Diagnosis', 'Age at Surge
 @st.cache_data
 def load_data():
     try:
-        df = pd.read_excel("https://github.com/kirbyju/tcia-cohort-builder/raw/refs/heads/main/clinical-data.csv")
+        df = pd.read_csv("https://github.com/kirbyju/tcia-cohort-builder/raw/refs/heads/main/clinical-data.csv")
 
         for col in df.columns:
             if col not in ['Age at Diagnosis', 'Age at Surgery', 'Age at Enrollment']:
@@ -114,7 +114,7 @@ def get_unique_sorted_values(column):
 filters = {}
 
 # Project Name filter
-project_names = get_unique_sorted_values('Project Name')
+project_names = get_unique_sorted_values('Project Short Name')
 filters['Project Name'] = st.sidebar.multiselect(
     'Project Name',
     options=project_names,
