@@ -43,7 +43,7 @@ def calculate_age_at_baseline(df, age_columns=['Age at Diagnosis', 'Age at Surge
 @st.cache_data
 def load_data():
     try:
-        df = pd.read_csv("https://github.com/kirbyju/tcia-cohort-builder/raw/refs/heads/main/clinical-data.csv")
+        df = pd.read_excel("https://github.com/kirbyju/tcia-cohort-builder/raw/refs/heads/main/clinical-data.xlsx")
 
         for col in df.columns:
             if col not in ['Age at Diagnosis', 'Age at Surgery', 'Age at Enrollment']:
