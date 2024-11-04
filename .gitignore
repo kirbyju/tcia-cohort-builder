@@ -160,3 +160,7 @@ cython_debug/
 #.idea/
 .DS_Store
 ~$clinical-data.xlsx
+gdc.xlsx
+nci_program_clinical.xlsx
+tcia-cohort-builder2.py
+nci_program_clinical.xlsx
