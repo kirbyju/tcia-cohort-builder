@@ -24,71 +24,108 @@ def debug_dataframe_info(df):
     st.write(f"Records with age data: {total_records - null_ages}")
     st.write(f"Records without age data: {null_ages}")
 
+# Get current theme
+is_dark_theme = st.get_option("theme.base") == "dark"
+
+# Custom CSS for markdown-rendered table
+dark_mode = """
+    .dataframe-table table th {
+        padding: 3px 7px;
+        border: 1px solid #4a4a4a;
+        background-color: #404040 !important;
+        font-weight: 600;
+        color: #ffffff !important;
+    }
+
+    .dataframe-table table td {
+        padding: 3px 7px;
+        border: 1px solid #4a4a4a;
+        color: #ffffff !important;
+    }
+
+    .dataframe-table table tr:hover {
+        background-color: #666666 !important;
+    }
+
+    .dataframe-table a {
+        color: #66b3ff !important;
+    }
+"""
+
+light_mode = """
+    .dataframe-table table th {
+        padding: 3px 7px;
+        border: 1px solid #ddd;
+        background-color: #f5f5f5 !important;
+        font-weight: 600;
+        color: #333;
+    }
+
+    .dataframe-table table td {
+        padding: 3px 7px;
+        border: 1px solid #ddd;
+        color: #333;
+    }
+
+    .dataframe-table table tr:hover {
+        background-color: #f8f9fa;
+    }
+
+    .dataframe-table a {
+        color: #0068c9;
+    }
+"""
+
 # Custom CSS to make the table scrollable
-st.markdown("""
+st.markdown(f"""
     <style>
-    .main .block-container {
+    .main .block-container {{
         max-width: 95%;
         padding-top: 1rem;
         padding-right: 1rem;
         padding-left: 1rem;
         padding-bottom: 1rem;
-    }
+    }}
 
-    section.main > div {
+    section.main > div {{
         padding-left: 2rem;
         padding-right: 2rem;
-    }
+    }}
 
-    .dataframe-table {
+    .dataframe-table {{
         display: block;
         overflow-x: auto;
         white-space: nowrap;
         width: 100%;
         font-size: 13px;
         font-family: "Source Sans Pro", sans-serif;
-    }
+    }}
 
-    .dataframe {
+    .dataframe-table table {{
         width: 100%;
         border-collapse: collapse;
         margin-bottom: 0;
-    }
+    }}
 
-    .dataframe th {
-        padding: 3px 7px;
-        border: 1px solid #ddd;
-        background-color: #f5f5f5;
-        font-weight: 600;
-    }
+    {dark_mode if is_dark_theme else light_mode}
 
-    .dataframe td {
-        padding: 3px 7px;
-        border: 1px solid #ddd;
-    }
-
-    .dataframe tr:hover {
-        background-color: #f8f9fa;
-    }
-
-    .dataframe a {
-        color: #0068c9;
+    .dataframe-table a {{
         text-decoration: none;
-    }
+    }}
 
-    .dataframe a:hover {
+    .dataframe-table a:hover {{
         text-decoration: underline;
-    }
+    }}
 
-    .button-container {
+    .button-container {{
         display: flex;
-        align-items: flex-end;  /* Aligns content to the bottom */
-        height: 100%;  /* Ensures full column height */
-    }
+        align-items: flex-end;
+        height: 100%;
+    }}
 
-    .stPlotlyChart {
+    .stPlotlyChart {{
         width: 100%;
-    }
+    }}
     </style>
     """, unsafe_allow_html=True)
 
@@ -318,7 +355,7 @@ def display_page(page_number, page_size):
     display_data['Available Images'] = display_data.apply(create_linked_images, axis=1)
 
     # Convert to HTML and display
-    st.markdown(f'<div class="dataframe-table">{display_data.to_html(escape=False)}</div>',
+    st.markdown(f'<div class="dataframe-table">{display_data.to_html(index=False, escape=False)}</div>',
                unsafe_allow_html=True)
 
 st.markdown("Use the filters on the left to select your cohort. Then, export a CSV of the table or generate a TCIA manifest file to download the radiology data.")
@@ -423,7 +460,7 @@ with st.container():
 
     with col3:
         # Display filtered dataframe without index
-        st.write(f"<div style='text-align: right;'>Showing {page_size} of {len(filtered_df)} records</div>", unsafe_allow_html=True)
+        st.write(f"<div style='text-align: right;'>{len(filtered_df)} total records</div>", unsafe_allow_html=True)
 
 # Visualizations
 st.subheader("Data Visualizations")
