@@ -345,7 +345,7 @@ def display_page(page_number, page_size):
         url = f"https://nbia.cancerimagingarchive.net/nbia-search/?PatientCriteria={case_id}"
 
         # Replace 'Both' with 'Radiology / Pathology' and add link
-        if available == 'Both':
+        if available == 'Radiology; Pathology':
             return f'<a href="{url}" target="_blank">Radiology</a> / Pathology'
         elif available == 'Radiology':
             return f'<a href="{url}" target="_blank">Radiology</a>'
