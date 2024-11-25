@@ -203,10 +203,10 @@ def load_data():
         st.error(f"Error loading data: {e}")
         return None
 
-# need to update to try/except once we change this to a url for further testing
+
 @st.cache_data
-def load_pathology_data(file_path='/Users/kirbyju/github/tcia-cohort-builder/pathology_test.xlsx'):
-    return pd.read_excel(file_path)
+def load_pathology_data():
+    return pd.read_excel("https://github.com/kirbyju/tcia-cohort-builder/raw/refs/heads/main/crdc-clinical.xlsx")
 
 # Helper function to apply filters with zero-based age filtering
 def filter_dataframe(df, filters, age_range=None, is_default_age_range=True):
