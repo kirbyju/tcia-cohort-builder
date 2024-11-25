@@ -1,9 +1,18 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+
+# for radiology downloads
 from tcia_utils import nbia
 
-from io import StringIO  # Add this import
+# for pathology downloads
+import requests
+from tqdm import tqdm
+import os
+import time
+
+# for debug function
+from io import StringIO
 
 # Fixed debug function
 def debug_dataframe_info(df):
@@ -180,7 +189,8 @@ def get_unique_sorted_values(df, column):
 @st.cache_data
 def load_data():
     try:
-        df = pd.read_excel("https://github.com/kirbyju/tcia-cohort-builder/raw/refs/heads/main/clinical-data.xlsx")
+        # includes nci projects: TCGA, CPTAC, Biobank
+        df = pd.read_excel("https://github.com/kirbyju/tcia-cohort-builder/raw/refs/heads/main/crdc-clinical.xlsx")
 
         for col in df.columns:
             if col not in ['Age at Diagnosis', 'Age at Surgery', 'Age at Enrollment']:
@@ -192,6 +202,11 @@ def load_data():
     except Exception as e:
         st.error(f"Error loading data: {e}")
         return None
+
+# need to update to try/except once we change this to a url for further testing
+@st.cache_data
+def load_pathology_data(file_path='/Users/kirbyju/github/tcia-cohort-builder/pathology_test.xlsx'):
+    return pd.read_excel(file_path)
 
 # Helper function to apply filters with zero-based age filtering
 def filter_dataframe(df, filters, age_range=None, is_default_age_range=True):
@@ -222,10 +237,13 @@ def filter_dataframe(df, filters, age_range=None, is_default_age_range=True):
 
 st.title('The Cancer Imaging Archive - Clinical Data Exploration')
 
-# Load the data
+# Load the clinical data
 df = load_data()
 if df is None:
     st.stop()
+
+# Load the pathology data
+pathology_data = load_pathology_data()
 
 # Display debug information at the top
 #debug_dataframe_info(df)
@@ -236,8 +254,17 @@ st.sidebar.header("Filters")
 # Initialize filters dictionary
 filters = {}
 
+# Available Images filter
+project_names = get_unique_sorted_values(df, 'Available Images')
+filters['Available Images'] = st.sidebar.multiselect(
+    'Available Images',
+    options=project_names,
+    default=[],
+    help="Select image types"
+)
+
 # Project Name filter
-project_names = get_unique_sorted_values(df, 'Project Short Name')  # Fixed: pass df as first argument
+project_names = get_unique_sorted_values(df, 'Project Short Name')
 filters['Project Short Name'] = st.sidebar.multiselect(
     'Project Short Name',
     options=project_names,
@@ -246,7 +273,7 @@ filters['Project Short Name'] = st.sidebar.multiselect(
 )
 
 # Race filter
-races = get_unique_sorted_values(df, 'Race')  # Fixed: pass df as first argument
+races = get_unique_sorted_values(df, 'Race')
 filters['Race'] = st.sidebar.multiselect(
     'Race',
     options=races,
@@ -255,7 +282,7 @@ filters['Race'] = st.sidebar.multiselect(
 )
 
 # Ethnicity filter
-ethnicities = get_unique_sorted_values(df, 'Ethnicity')  # Fixed: pass df as first argument
+ethnicities = get_unique_sorted_values(df, 'Ethnicity')
 filters['Ethnicity'] = st.sidebar.multiselect(
     'Ethnicity',
     options=ethnicities,
@@ -264,7 +291,7 @@ filters['Ethnicity'] = st.sidebar.multiselect(
 )
 
 # Sex at Birth filter
-sexes = get_unique_sorted_values(df, 'Sex at Birth')  # Fixed: pass df as first argument
+sexes = get_unique_sorted_values(df, 'Sex at Birth')
 filters['Sex at Birth'] = st.sidebar.multiselect(
     'Sex at Birth',
     options=sexes,
@@ -273,7 +300,7 @@ filters['Sex at Birth'] = st.sidebar.multiselect(
 )
 
 # Primary Diagnosis filter
-diagnoses = get_unique_sorted_values(df, 'Primary Diagnosis')  # Fixed: pass df as first argument
+diagnoses = get_unique_sorted_values(df, 'Primary Diagnosis')
 filters['Primary Diagnosis'] = st.sidebar.multiselect(
     'Primary Diagnosis',
     options=diagnoses,
@@ -282,7 +309,7 @@ filters['Primary Diagnosis'] = st.sidebar.multiselect(
 )
 
 # Primary Site filter
-sites = get_unique_sorted_values(df, 'Primary Site')  # Fixed: pass df as first argument
+sites = get_unique_sorted_values(df, 'Primary Site')
 filters['Primary Site'] = st.sidebar.multiselect(
     'Primary Site',
     options=sites,
@@ -338,13 +365,12 @@ def display_page(page_number, page_size):
     reordered_columns = ['Project Short Name', 'Case ID', 'Available Images'] + [col for col in all_columns if col not in ['Project Short Name', 'Case ID']]
     display_data = display_data[reordered_columns]
 
-    # Function to create the clickable link for Radiology
+    # Function to create the clickable links for viewing images prior to download via NBIA/caMicroscope (latter not yet added)
     def create_linked_images(row):
         available = row['Available Images']
         case_id = row['Case ID']
         url = f"https://nbia.cancerimagingarchive.net/nbia-search/?PatientCriteria={case_id}"
 
-        # Replace 'Both' with 'Radiology / Pathology' and add link
         if available == 'Radiology; Pathology':
             return f'<a href="{url}" target="_blank">Radiology</a> / Pathology'
         elif available == 'Radiology':
@@ -355,7 +381,7 @@ def display_page(page_number, page_size):
     display_data['Available Images'] = display_data.apply(create_linked_images, axis=1)
 
     # Convert to HTML and display
-    st.markdown(f'<div class="dataframe-table">{display_data.to_html(index=False, escape=False)}</div>',
+    st.markdown(f'<div class="dataframe-table">{display_data.to_html(index=True, escape=False)}</div>',
                unsafe_allow_html=True)
 
 st.markdown("Use the filters on the left to select your cohort. Then, export a CSV of the table or generate a TCIA manifest file to download the radiology data.")
@@ -418,7 +444,10 @@ with st.container():
 page_number = st.session_state.page_number
 display_page(page_number, page_size)
 
-# Define a single row for page size and pagination controls
+# summarize total records
+st.write(f"<div style='text-align: right;'>{len(filtered_df)} total records</div>", unsafe_allow_html=True)
+
+# Define a container for download buttons
 with st.container():
     col1, col2, col3 = st.columns([1, 2, 1])  # Adjust column widths as needed
 
@@ -459,8 +488,105 @@ with st.container():
                 st.error(f"Error generating manifest: {str(e)}")
 
     with col3:
-        # Display filtered dataframe without index
-        st.write(f"<div style='text-align: right;'>{len(filtered_df)} total records</div>", unsafe_allow_html=True)
+        # Step 2: Automatically filter for Case IDs with available Pathology images
+        filtered_case_ids = filtered_df[filtered_df['Available Images'].str.contains('Pathology', na=False)]['Case ID'].unique()
+
+        # Step 3: Specify download directory
+        download_dir = st.text_input("Specify the directory to save pathology images:", value=os.path.expanduser("~"))
+
+        # Button to download pathology images for these cases
+        if st.button("Download Pathology Images"):
+            if not os.path.isdir(download_dir):
+                st.error(f"The specified directory {download_dir} does not exist.")
+            elif len(filtered_case_ids) == 0:
+                st.warning("No cases with available pathology images found in the filtered data.")
+            else:
+                # Filter pathology_data by `patient_id` that matches `filtered_case_ids`
+                selected_data = pathology_data[pathology_data['patient_id'].isin(filtered_case_ids)]
+
+                total_images = len(selected_data)
+
+                # Initialize a single progress bar and status text element for compact display
+                status_text = st.empty()
+                current_file_progress_bar = st.progress(0)
+                summary_text = st.empty()
+                overall_progress_bar = st.progress(0)
+
+                for idx, (_, row) in enumerate(selected_data.iterrows(), 1):
+                    url = row['imageUrl']
+                    patient_id = row['patient_id']
+
+                    # Extract path after '/ross/' to create subdirectory structure
+                    sub_path = url.split('/ross/', 1)[-1]
+                    file_path = os.path.join(download_dir, sub_path)
+
+                    # Update status for the current download
+                    status_text.text(f"Downloading image {idx} out of {total_images} total images.")
+
+                    # Helper function to download file with a progress bar for each file
+                    def download_file_with_progress(url, file_path):
+                        """Download file with progress bar and estimated time remaining."""
+                        try:
+                            # Get the total file size (fallback to 0 if content-length header is missing)
+                            response = requests.head(url, allow_redirects=True)
+                            total_size = int(response.headers.get('content-length', 0))
+
+                            # If total_size is zero, progress cannot be calculated accurately
+                            if total_size == 0:
+                                st.warning(f"Cannot determine file size for {file_path}. Progress will not be shown accurately.")
+
+                            # Create directories if they don't exist
+                            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+                            # Stream download with progress tracking
+                            start_time = time.time()
+                            downloaded_size = 0
+
+                            with requests.get(url, stream=True, timeout=30) as response, open(file_path, 'wb') as file:
+                                response.raise_for_status()
+
+                                # Reset progress bar for the current file
+                                current_file_progress_bar.progress(0)
+
+                                for chunk in response.iter_content(chunk_size=8192):
+                                    file.write(chunk)
+                                    downloaded_size += len(chunk)
+
+                                    # Calculate and clamp progress percentage
+                                    progress_percent = min(downloaded_size / total_size, 1.0) if total_size > 0 else 1.0
+                                    current_file_progress_bar.progress(progress_percent)
+
+                                    # Calculate estimated time remaining
+                                    elapsed_time = time.time() - start_time
+                                    speed = downloaded_size / elapsed_time if elapsed_time > 0 else 0
+                                    estimated_time_remaining = (total_size - downloaded_size) / speed if speed > 0 else 0
+                                    minutes, seconds = divmod(estimated_time_remaining, 60)
+
+                                    # Update status text
+                                    status_text.text(
+                                        f"Downloading image {idx} of {total_images}: {progress_percent * 100:.2f}% complete. "
+                                        f"Estimated time remaining: {int(minutes)}m {int(seconds)}s."
+                                    )
+
+                            return True  # Success
+
+                        except requests.exceptions.RequestException as e:
+                            st.write(f"Failed to download {file_path}: {e}")
+                            return False  # Failed
+
+                    # Download file with progress display
+                    success = download_file_with_progress(url, file_path)
+
+                    if success:
+                        summary_text.text(f"Downloaded {idx} out of {total_images} total images.")
+                    else:
+                        st.write(f"Failed to download image for patient ID {patient_id} after multiple attempts.")
+
+                    # Update overall progress bar
+                    overall_progress_bar.progress(idx / total_images)
+
+                st.success("Download process completed for all selected pathology images!")
+
 
 # Visualizations
 st.subheader("Data Visualizations")
