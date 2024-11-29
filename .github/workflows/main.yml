@@ -45,7 +45,7 @@ jobs:
       
     - name: Build with PyInstaller
       run: |
-        pyinstaller --onefile --windowed --name "TCIA_Pathology_Downloader" your_script.py
+        pyinstaller --onefile --windowed --name "TCIA_Pathology_Downloader" pathology-downloader.py
       
     - name: Upload artifact
       uses: actions/upload-artifact@v4
