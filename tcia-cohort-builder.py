@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import os
 
 # for radiology downloads
 from tcia_utils import nbia
@@ -10,11 +11,13 @@ import requests
 from tqdm import tqdm
 import os
 import time
+from io import BytesIO
+import xlsxwriter
 
 # for debug function
 from io import StringIO
 
-# Fixed debug function
+# debug function
 def debug_dataframe_info(df):
     st.write("### DataFrame Debug Information")
     st.write(f"Total records: {len(df)}")
@@ -206,7 +209,7 @@ def load_data():
 
 @st.cache_data
 def load_pathology_data():
-    return pd.read_excel("https://github.com/kirbyju/tcia-cohort-builder/raw/refs/heads/main/crdc-clinical.xlsx")
+    return pd.read_excel("https://github.com/kirbyju/tcia-cohort-builder/raw/refs/heads/main/pathology_image_metadata.xlsx")
 
 # Helper function to apply filters with zero-based age filtering
 def filter_dataframe(df, filters, age_range=None, is_default_age_range=True):
@@ -234,6 +237,50 @@ def filter_dataframe(df, filters, age_range=None, is_default_age_range=True):
             ]
 
     return filtered_df
+
+def generate_pathology_manifest(filtered_df, pathology_data):
+    """
+    Generate an Excel file containing pathology image URLs for the filtered cases
+
+    Parameters:
+    - filtered_df: DataFrame of filtered clinical data
+    - pathology_data: Original pathology data DataFrame
+
+    Returns:
+    - Pandas DataFrame with pathology image URLs
+    """
+    # Ensure the 'Case ID' column exists in both dataframes
+    if 'Case ID' not in filtered_df.columns:
+        raise ValueError("The 'Case ID' column is missing from the filtered_df dataframe.")
+    if 'Case ID' not in pathology_data.columns:
+        raise ValueError("The 'Case ID' column is missing from the pathology_data dataframe.")
+
+    # Ensure the required columns are in pathology_data
+    required_columns = ['Case ID', 'imageId', 'slideId', 'imageHeight', 'imagedWidth', 'physicalPixelSizeX', 'physicalPixelSizeY', 'imageUrl', 'created', 'changed']
+    missing_columns = [col for col in required_columns if col not in pathology_data.columns]
+    if missing_columns:
+        raise ValueError(f"The following required columns are missing from pathology_data: {missing_columns}")
+
+    # Step 1: Get Case IDs with available Pathology images
+    filtered_case_ids = filtered_df[
+        filtered_df['Available Images'].str.contains('Pathology', na=False)
+    ]['Case ID'].unique()
+
+    # Step 2: Filter pathology data to match filtered cases
+    pathology_manifest = pathology_data[
+        pathology_data['Case ID'].isin(filtered_case_ids)
+    ][required_columns].copy()
+
+    # Step 3: Merge the filtered_df with the required columns from pathology_data
+    merged_manifest = filtered_df.merge(
+        pathology_manifest,
+        on='Case ID',
+        how='left'
+    )
+
+    return merged_manifest
+
+
 
 st.title('The Cancer Imaging Archive - Clinical Data Exploration')
 
@@ -371,6 +418,9 @@ def display_page(page_number, page_size):
         case_id = row['Case ID']
         url = f"https://nbia.cancerimagingarchive.net/nbia-search/?PatientCriteria={case_id}"
 
+        # reminder of URL structure for camicroscope viewer
+        #pathology_url = f"https://pathdb.cancerimagingarchive.net/caMicroscope/apps/mini/viewer.html?mode=pathdb&slideid=211646"
+
         if available == 'Radiology; Pathology':
             return f'<a href="{url}" target="_blank">Radiology</a> / Pathology'
         elif available == 'Radiology':
@@ -449,12 +499,12 @@ st.write(f"<div style='text-align: right;'>{len(filtered_df)} total records</div
 
 # Define a container for download buttons
 with st.container():
-    col1, col2, col3 = st.columns([1, 2, 1])  # Adjust column widths as needed
+    col1, col2, col3 = st.columns([1, 1, 1])  # Adjust column widths as needed
 
     # Page size
     with col1:
         st.download_button(
-            label="Download CSV",
+            label="Download Clinical CSV",
             data=csv,
             file_name="filtered_cancer_imaging_data.csv",
             mime="text/csv",
@@ -488,104 +538,38 @@ with st.container():
                 st.error(f"Error generating manifest: {str(e)}")
 
     with col3:
-        # Step 2: Automatically filter for Case IDs with available Pathology images
-        filtered_case_ids = filtered_df[filtered_df['Available Images'].str.contains('Pathology', na=False)]['Case ID'].unique()
+        # Step 1: Automatically filter for Case IDs with available Pathology images
+        filtered_case_ids = filtered_df[
+            filtered_df['Available Images'].str.contains('Pathology', na=False)
+        ]['Case ID'].unique()
 
-        # Step 3: Specify download directory
-        download_dir = st.text_input("Specify the directory to save pathology images:", value=os.path.expanduser("~"))
+        # Generate Pathology Manifest Button
+        if st.button("Generate Pathology Manifest"):
+            try:
+                # Generate the manifest
+                pathology_manifest = generate_pathology_manifest(filtered_df, pathology_data)
 
-        # Button to download pathology images for these cases
-        if st.button("Download Pathology Images"):
-            if not os.path.isdir(download_dir):
-                st.error(f"The specified directory {download_dir} does not exist.")
-            elif len(filtered_case_ids) == 0:
-                st.warning("No cases with available pathology images found in the filtered data.")
-            else:
-                # Filter pathology_data by `patient_id` that matches `filtered_case_ids`
-                selected_data = pathology_data[pathology_data['patient_id'].isin(filtered_case_ids)]
+                # Download manifest
+                excel_buffer = BytesIO()
+                with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
+                    pathology_manifest.to_excel(writer, index=False, sheet_name='Pathology_Images')
+                excel_buffer.seek(0)
 
-                total_images = len(selected_data)
+                st.download_button(
+                    label="Download Pathology Manifest (Excel)",
+                    data=excel_buffer,
+                    file_name="tcia_pathology_manifest.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="pathology_manifest_excel"
+                )
 
-                # Initialize a single progress bar and status text element for compact display
-                status_text = st.empty()
-                current_file_progress_bar = st.progress(0)
-                summary_text = st.empty()
-                overall_progress_bar = st.progress(0)
+                # Provide instructions
+                st.info(
+                    "Use this manifest with the [TCIA Pathology Download Manager](https://github.com/kirbyju/pathology-downloader) to start downloading."
+                )
 
-                for idx, (_, row) in enumerate(selected_data.iterrows(), 1):
-                    url = row['imageUrl']
-                    patient_id = row['patient_id']
-
-                    # Extract path after '/ross/' to create subdirectory structure
-                    sub_path = url.split('/ross/', 1)[-1]
-                    file_path = os.path.join(download_dir, sub_path)
-
-                    # Update status for the current download
-                    status_text.text(f"Downloading image {idx} out of {total_images} total images.")
-
-                    # Helper function to download file with a progress bar for each file
-                    def download_file_with_progress(url, file_path):
-                        """Download file with progress bar and estimated time remaining."""
-                        try:
-                            # Get the total file size (fallback to 0 if content-length header is missing)
-                            response = requests.head(url, allow_redirects=True)
-                            total_size = int(response.headers.get('content-length', 0))
-
-                            # If total_size is zero, progress cannot be calculated accurately
-                            if total_size == 0:
-                                st.warning(f"Cannot determine file size for {file_path}. Progress will not be shown accurately.")
-
-                            # Create directories if they don't exist
-                            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-
-                            # Stream download with progress tracking
-                            start_time = time.time()
-                            downloaded_size = 0
-
-                            with requests.get(url, stream=True, timeout=30) as response, open(file_path, 'wb') as file:
-                                response.raise_for_status()
-
-                                # Reset progress bar for the current file
-                                current_file_progress_bar.progress(0)
-
-                                for chunk in response.iter_content(chunk_size=8192):
-                                    file.write(chunk)
-                                    downloaded_size += len(chunk)
-
-                                    # Calculate and clamp progress percentage
-                                    progress_percent = min(downloaded_size / total_size, 1.0) if total_size > 0 else 1.0
-                                    current_file_progress_bar.progress(progress_percent)
-
-                                    # Calculate estimated time remaining
-                                    elapsed_time = time.time() - start_time
-                                    speed = downloaded_size / elapsed_time if elapsed_time > 0 else 0
-                                    estimated_time_remaining = (total_size - downloaded_size) / speed if speed > 0 else 0
-                                    minutes, seconds = divmod(estimated_time_remaining, 60)
-
-                                    # Update status text
-                                    status_text.text(
-                                        f"Downloading image {idx} of {total_images}: {progress_percent * 100:.2f}% complete. "
-                                        f"Estimated time remaining: {int(minutes)}m {int(seconds)}s."
-                                    )
-
-                            return True  # Success
-
-                        except requests.exceptions.RequestException as e:
-                            st.write(f"Failed to download {file_path}: {e}")
-                            return False  # Failed
-
-                    # Download file with progress display
-                    success = download_file_with_progress(url, file_path)
-
-                    if success:
-                        summary_text.text(f"Downloaded {idx} out of {total_images} total images.")
-                    else:
-                        st.write(f"Failed to download image for patient ID {patient_id} after multiple attempts.")
-
-                    # Update overall progress bar
-                    overall_progress_bar.progress(idx / total_images)
-
-                st.success("Download process completed for all selected pathology images!")
+            except Exception as e:
+                st.error(f"Error generating pathology manifest: {str(e)}")
 
 
 # Visualizations
