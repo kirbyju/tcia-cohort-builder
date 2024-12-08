@@ -1,14 +1,12 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import os
 
 # for radiology downloads
 from tcia_utils import nbia
 
 # for pathology downloads
 import requests
-from tqdm import tqdm
 import os
 import time
 from io import BytesIO
@@ -565,7 +563,7 @@ with st.container():
 
                 # Provide instructions
                 st.info(
-                    "Use this manifest with the [TCIA Pathology Download Manager](https://github.com/kirbyju/pathology-downloader) to start downloading."
+                    "Use this manifest with the [TCIA Download Manager](https://github.com/kirbyju/tcia_download_manager) to start downloading."
                 )
 
             except Exception as e:
