@@ -1,4 +1,8 @@
 import streamlit as st
+
+# Set page to wide layout
+st.set_page_config(layout="wide")
+
 import pandas as pd
 import plotly.express as px
 
@@ -210,6 +214,7 @@ def load_pathology_data():
     return pd.read_excel("https://github.com/kirbyju/tcia-cohort-builder/raw/refs/heads/main/pathology_image_metadata.xlsx")
 
 # Helper function to apply filters with zero-based age filtering
+@st.cache_data
 def filter_dataframe(df, filters, age_range=None, is_default_age_range=True):
     filtered_df = df.copy()
 
@@ -299,68 +304,60 @@ st.sidebar.header("Filters")
 # Initialize filters dictionary
 filters = {}
 
-# Available Images filter
-project_names = get_unique_sorted_values(df, 'Available Images')
-filters['Available Images'] = st.sidebar.multiselect(
-    'Available Images',
-    options=project_names,
-    default=[],
-    help="Select image types"
-)
+with st.sidebar.expander("Image and Project Filters"):
+    project_names = get_unique_sorted_values(df, 'Available Images')
+    filters['Available Images'] = st.multiselect(
+        'Available Images',
+        options=project_names,
+        default=[],
+        help="Select image types"
+    )
+    project_names = get_unique_sorted_values(df, 'Project Short Name')
+    filters['Project Short Name'] = st.multiselect(
+        'Project Short Name',
+        options=project_names,
+        default=[],
+        help="Select one or more projects"
+    )
 
-# Project Name filter
-project_names = get_unique_sorted_values(df, 'Project Short Name')
-filters['Project Short Name'] = st.sidebar.multiselect(
-    'Project Short Name',
-    options=project_names,
-    default=[],
-    help="Select one or more projects"
-)
+with st.sidebar.expander("Demographic Filters"):
+    races = get_unique_sorted_values(df, 'Race')
+    filters['Race'] = st.multiselect(
+        'Race',
+        options=races,
+        default=[],
+        help="Select one or more races"
+    )
+    ethnicities = get_unique_sorted_values(df, 'Ethnicity')
+    filters['Ethnicity'] = st.multiselect(
+        'Ethnicity',
+        options=ethnicities,
+        default=[],
+        help="Select one or more ethnicities"
+    )
+    sexes = get_unique_sorted_values(df, 'Sex at Birth')
+    filters['Sex at Birth'] = st.multiselect(
+        'Sex at Birth',
+        options=sexes,
+        default=[],
+        help="Select one or more sex categories"
+    )
 
-# Race filter
-races = get_unique_sorted_values(df, 'Race')
-filters['Race'] = st.sidebar.multiselect(
-    'Race',
-    options=races,
-    default=[],
-    help="Select one or more races"
-)
-
-# Ethnicity filter
-ethnicities = get_unique_sorted_values(df, 'Ethnicity')
-filters['Ethnicity'] = st.sidebar.multiselect(
-    'Ethnicity',
-    options=ethnicities,
-    default=[],
-    help="Select one or more ethnicities"
-)
-
-# Sex at Birth filter
-sexes = get_unique_sorted_values(df, 'Sex at Birth')
-filters['Sex at Birth'] = st.sidebar.multiselect(
-    'Sex at Birth',
-    options=sexes,
-    default=[],
-    help="Select one or more sex categories"
-)
-
-# Primary Diagnosis filter
-diagnoses = get_unique_sorted_values(df, 'Primary Diagnosis')
-filters['Primary Diagnosis'] = st.sidebar.multiselect(
-    'Primary Diagnosis',
-    options=diagnoses,
-    default=[],
-    help="Select one or more diagnoses"
-)
-
-# Primary Site filter
-sites = get_unique_sorted_values(df, 'Primary Site')
-filters['Primary Site'] = st.sidebar.multiselect(
-    'Primary Site',
-    options=sites,
-    default=[],
-    help="Select one or more primary sites"
-)
+with st.sidebar.expander("Clinical Filters"):
+    diagnoses = get_unique_sorted_values(df, 'Primary Diagnosis')
+    filters['Primary Diagnosis'] = st.multiselect(
+        'Primary Diagnosis',
+        options=diagnoses,
+        default=[],
+        help="Select one or more diagnoses"
+    )
+    sites = get_unique_sorted_values(df, 'Primary Site')
+    filters['Primary Site'] = st.multiselect(
+        'Primary Site',
+        options=sites,
+        default=[],
+        help="Select one or more primary sites"
+    )
 
 # Add Age Range Filter starting from 0
 # Get max age, excluding null values
@@ -410,20 +407,22 @@ def display_page(page_number, page_size):
     reordered_columns = ['Project Short Name', 'Case ID', 'Available Images'] + [col for col in all_columns if col not in ['Project Short Name', 'Case ID']]
     display_data = display_data[reordered_columns]
 
-    # Function to create the clickable links for viewing images prior to download via NBIA/caMicroscope (latter not yet added)
+    # Function to create the clickable links for viewing images
     def create_linked_images(row):
         available = row['Available Images']
         case_id = row['Case ID']
-        url = f"https://nbia.cancerimagingarchive.net/nbia-search/?PatientCriteria={case_id}"
 
-        # reminder of URL structure for camicroscope viewer
-        #pathology_url = f"https://pathdb.cancerimagingarchive.net/caMicroscope/apps/mini/viewer.html?mode=pathdb&slideid=211646"
+        links = []
+        if 'Radiology' in available:
+            radiology_url = f"https://nbia.cancerimagingarchive.net/nbia-search/?PatientCriteria={case_id}"
+            links.append(f'<a href="{radiology_url}" target="_blank">Radiology</a>')
 
-        if available == 'Radiology; Pathology':
-            return f'<a href="{url}" target="_blank">Radiology</a> / Pathology'
-        elif available == 'Radiology':
-            return f'<a href="{url}" target="_blank">Radiology</a>'
-        return available
+        if 'Pathology' in available:
+            pathology_url_template = "https://pathdb.cancerimagingarchive.net/eaglescope/dist/?configurl=%2Fsystem%2Ffiles%2Fcollectionmetadata%2F202401%2Fcohort_builder_01-27-2024.json&filterState=%5B%7B%22id%22%3A%22_it43p667h%22%2C%22field%22%3A%22_SEARCH%22%2C%22operation%22%3A%22search%22%2C%22values%22%3A%5B%22{}%22%5D%7D%5D"
+            pathology_url = pathology_url_template.format(case_id)
+            links.append(f'<a href="{pathology_url}" target="_blank">Pathology</a>')
+
+        return ' / '.join(links) if links else available
 
     # Create a display version of Available Images column
     display_data['Available Images'] = display_data.apply(create_linked_images, axis=1)
@@ -435,71 +434,10 @@ def display_page(page_number, page_size):
 st.markdown("Use the filters on the left to select your cohort. Then, export a CSV of the table or generate a TCIA manifest file to download the radiology data.")
 st.markdown("Images may also be viewed for specific subjects before downloading by clicking the links in the Available Images columns.")
 
-# Define a single row for page size and pagination controls
-with st.container():
-    col1, col2, col3 = st.columns([.75, 3, 1])  # Adjust column widths as needed
-
-    # Page size
-    with col1:
-        page_size = st.number_input('Page Size', min_value=1, max_value=100, value=10)
-
-    # Manifest Generation/Download button
-    with col2:
-        # empty placeholder -- add intro instructions here later?
-        st.write("")
-
-    # Page Number control
-    with col3:
-        # Calculate total number of pages
-        max_page = max(0, (len(filtered_df) - 1) // page_size)
-
-        # Initialize page number in session state for navigation
-        if 'page_number' not in st.session_state:
-            st.session_state.page_number = 0
-
-        # Page navigation controls with compact buttons
-        nav_col1, nav_col2, nav_col3 = st.columns([0.5, 1, 0.5])
-
-        # Compact '<' button to go to the previous page
-        with nav_col1:
-            # add empty lines for vertical alignment with results/page widget
-            st.write("")
-            st.write("")
-            if st.button("‹") and st.session_state.page_number > 0:
-                st.session_state.page_number -= 1
-
-        with nav_col2:
-            # add empty lines for vertical alignment with results/page widget
-            st.write("")
-            st.write("")
-            # display info about what page you're on
-            st.markdown(
-                f"<div style='text-align: center; padding-top: 10px;'>"
-                f"Page {st.session_state.page_number + 1} of {max_page + 1}"
-                f"</div>",
-                unsafe_allow_html=True
-            )
-
-        # Compact '>' button to go to the next page
-        with nav_col3:
-            # add empty lines for vertical alignment with results/page widget
-            st.write("")
-            st.write("")
-            if st.button("›") and st.session_state.page_number < max_page:
-                st.session_state.page_number += 1
-
-# Display the current page with scrollable table
-page_number = st.session_state.page_number
-display_page(page_number, page_size)
-
-# summarize total records
-st.write(f"<div style='text-align: right;'>{len(filtered_df)} total records</div>", unsafe_allow_html=True)
-
 # Define a container for download buttons
 with st.container():
-    col1, col2, col3 = st.columns([1, 1, 1])  # Adjust column widths as needed
+    col1, col2, col3 = st.columns([1, 1, 1])
 
-    # Page size
     with col1:
         st.download_button(
             label="Download Clinical CSV",
@@ -512,16 +450,12 @@ with st.container():
     with col2:
         if st.button('Generate Radiology Manifest'):
             try:
-                # Fetch patient IDs from the filtered DataFrame
                 patientIds = filtered_df['Case ID'].unique().tolist()
-                # Retrieve manifest text
                 manifest_text = nbia.getSimpleSearchWithModalityAndBodyPartPaged(
                     patients=patientIds,
                     format="manifest_text"
                 )
                 st.success("Manifest generated successfully! Click 'Download Manifest' to save.")
-
-                # Display download button for manifest if generated
                 if isinstance(manifest_text, str):
                     st.download_button(
                         label="Download Radiology Manifest",
@@ -536,23 +470,13 @@ with st.container():
                 st.error(f"Error generating manifest: {str(e)}")
 
     with col3:
-        # Step 1: Automatically filter for Case IDs with available Pathology images
-        filtered_case_ids = filtered_df[
-            filtered_df['Available Images'].str.contains('Pathology', na=False)
-        ]['Case ID'].unique()
-
-        # Generate Pathology Manifest Button
         if st.button("Generate Pathology Manifest"):
             try:
-                # Generate the manifest
                 pathology_manifest = generate_pathology_manifest(filtered_df, pathology_data)
-
-                # Download manifest
                 excel_buffer = BytesIO()
                 with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
                     pathology_manifest.to_excel(writer, index=False, sheet_name='Pathology_Images')
                 excel_buffer.seek(0)
-
                 st.download_button(
                     label="Download Pathology Manifest (Excel)",
                     data=excel_buffer,
@@ -560,14 +484,53 @@ with st.container():
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="pathology_manifest_excel"
                 )
-
-                # Provide instructions
-                st.info(
-                    "Use this manifest with the [TCIA Download Manager](https://github.com/kirbyju/tcia_download_manager) to start downloading."
-                )
-
+                st.info("Use this manifest with the [TCIA Download Manager](https://github.com/kirbyju/tcia_download_manager) to start downloading.")
             except Exception as e:
                 st.error(f"Error generating pathology manifest: {str(e)}")
+
+# Define a single row for page size and pagination controls
+with st.container():
+    col1, col2, col3 = st.columns([.75, 3, 1])
+
+    with col1:
+        page_size = st.number_input('Page Size', min_value=1, max_value=100, value=10)
+
+    with col2:
+        st.write("")
+
+    with col3:
+        max_page = max(0, (len(filtered_df) - 1) // page_size)
+        if 'page_number' not in st.session_state:
+            st.session_state.page_number = 0
+
+        nav_col1, nav_col2, nav_col3 = st.columns([0.5, 1, 0.5])
+
+        with nav_col1:
+            st.write("")
+            st.write("")
+            if st.button("‹") and st.session_state.page_number > 0:
+                st.session_state.page_number -= 1
+
+        with nav_col2:
+            st.write("")
+            st.write("")
+            st.markdown(
+                f"<div style='text-align: center; padding-top: 10px;'>Page {st.session_state.page_number + 1} of {max_page + 1}</div>",
+                unsafe_allow_html=True
+            )
+
+        with nav_col3:
+            st.write("")
+            st.write("")
+            if st.button("›") and st.session_state.page_number < max_page:
+                st.session_state.page_number += 1
+
+# Display the current page with scrollable table
+page_number = st.session_state.page_number
+display_page(page_number, page_size)
+
+# summarize total records
+st.write(f"<div style='text-align: right;'>{len(filtered_df)} total records</div>", unsafe_allow_html=True)
 
 
 # Visualizations
