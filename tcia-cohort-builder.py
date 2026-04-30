@@ -352,8 +352,13 @@ if st.session_state.selected_patient:
                         if not rad_series.empty:
                             st.write("**Radiology (IDC)**")
                             for _, s_row in rad_series.iterrows():
-                                ohif_url = f"https://viewer.imaging.datacommons.cancer.gov/v3/viewer/?StudyInstanceUIDs={s_row['StudyInstanceUID']}&SeriesInstanceUIDs={s_row['SeriesInstanceUID']}"
-                                st.markdown(f"- **{s_row['Modality']}**: {s_row['SeriesDescription']} ([View in OHIF]({ohif_url}))")
+                                if s_row['Modality'] == 'SM':
+                                    view_url = f"https://viewer.imaging.datacommons.cancer.gov/slim/studies/{s_row['StudyInstanceUID']}/series/{s_row['SeriesInstanceUID']}"
+                                    view_label = "View in SliM"
+                                else:
+                                    view_url = f"https://viewer.imaging.datacommons.cancer.gov/v3/viewer/?StudyInstanceUIDs={s_row['StudyInstanceUID']}&SeriesInstanceUIDs={s_row['SeriesInstanceUID']}"
+                                    view_label = "View in OHIF"
+                                st.markdown(f"- **{s_row['Modality']}**: {s_row['SeriesDescription']} ([{view_label}]({view_url}))")
 
                         # Pathology Images
                         path_imgs = p_path[p_path['created'].astype(str).str[:10] == date] if not p_path.empty else pd.DataFrame()
