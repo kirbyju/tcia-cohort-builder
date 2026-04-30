@@ -2,6 +2,8 @@ import pandas as pd
 import requests
 from idc_index import IDCClient
 import os
+import json
+import urllib.request
 
 def fetch_wp_metadata():
     print("Fetching WordPress metadata...")
@@ -104,6 +106,38 @@ def fetch_idc_metadata():
     else:
         print("No IDC records found.")
 
+def fetch_gc_metadata():
+    print("Fetching General Commons metadata...")
+    endpoint = "https://general.datacommons.cancer.gov/v1/graphql/"
+    phs = "phs004225"
+    query = """
+    query TCIAStudies($phs: [String], $first: Int) {
+      studies(phs_accessions: $phs, first: $first) {
+        study_acronym
+      }
+    }
+    """
+    payload = json.dumps({"query": query, "variables": {"phs": ["phs004225"], "first": 10000}}).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={"Content-Type": "application/json", "User-Agent": "tcia-query-skill/1.0"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            studies = result.get("data", {}).get("studies", [])
+            df = pd.DataFrame(studies)
+            if not df.empty:
+                df.to_parquet('gc_metadata.parquet')
+                print(f"Saved {len(df)} GC study acronyms.")
+            else:
+                print("No GC studies found.")
+    except Exception as e:
+        print(f"Error fetching GC metadata: {e}")
+
 if __name__ == "__main__":
     fetch_wp_metadata()
     fetch_idc_metadata()
+    fetch_gc_metadata()

@@ -67,6 +67,17 @@ def load_wp_metadata():
         return {}
 
 @st.cache_data
+def load_gc_metadata():
+    try:
+        if os.path.exists('gc_metadata.parquet'):
+            df = pd.read_parquet('gc_metadata.parquet')
+            return df['study_acronym'].tolist()
+        return []
+    except Exception as e:
+        st.warning(f"Error loading General Commons metadata from parquet: {e}")
+        return []
+
+@st.cache_data
 def load_idc_metadata(project_list):
     try:
         if os.path.exists('idc_metadata.parquet'):
@@ -180,6 +191,7 @@ if df_clin is None:
 
 pathology_data = load_pathology_data()
 wp_metadata = load_wp_metadata()
+gc_metadata = load_gc_metadata()
 # Only load IDC metadata for projects present in clinical data
 all_projects = df_clin['Project Short Name'].unique()
 idc_data = load_idc_metadata(all_projects)
@@ -259,9 +271,8 @@ st.write(f"Showing {len(filtered_df)} patients based on filters.")
 st.subheader("1. Select a Patient")
 
 def get_project_display(project):
-    meta = wp_metadata.get(project, {})
-    if meta.get('is_controlled'):
-        return f"⚠️ {project} (Controlled)"
+    if project in gc_metadata:
+        return f"⚠️ {project} (Mixed/Controlled)"
     return project
 
 display_df = filtered_df[['Project Short Name', 'Case ID', 'Available Images', 'Sex at Birth', 'Age at Baseline']].copy()
@@ -285,7 +296,7 @@ if 'selected_patient' not in st.session_state:
 # Using selection mode in st.dataframe (requires Streamlit >= 1.35.0)
 event = st.dataframe(
     display_df.iloc[start_idx:end_idx],
-    use_container_width=True,
+        width="stretch",
     hide_index=True,
     on_select="rerun",
     selection_mode="single-row"
@@ -305,73 +316,73 @@ if st.session_state.selected_patient:
 
     st.subheader(f"2. Imaging Details for Patient: {patient_id}")
 
-    meta = wp_metadata.get(project_id, {})
-    if meta.get('is_controlled'):
-        st.warning(f"**{project_id}** is a **Controlled Access** dataset. "
-                   "Visualization is not available in the browser. "
-                   "Please follow the [TCIA Controlled Data Access Policy](https://www.cancerimagingarchive.net/nih-controlled-data-access-policy/) to request access.")
+    # Access logic:
+    # 1. If data is in idc_data or pathology_data for this patient, it is open access.
+    # 2. If the project is in gc_metadata, it MIGHT have controlled access data in GC.
 
-        # Still show metadata summary even for controlled access
+    col_detail1, col_detail2 = st.columns([1, 2])
+
+    with col_detail1:
+        st.write("**Studies & Images**")
+
+        # Get radiology data for this patient
+        p_idc = idc_data[idc_data['PatientID'] == patient_id] if not idc_data.empty else pd.DataFrame()
+        # Get pathology data for this patient
+        p_path = pathology_data[pathology_data['Case ID'] == patient_id] if pathology_data is not None else pd.DataFrame()
+
+        # Combine all unique dates
+        all_dates = set()
+        if not p_idc.empty:
+            all_dates.update(p_idc['StudyDate'].unique())
+
+        if not p_path.empty:
+            # Try to use 'created' date from pathology metadata if possible
+            path_dates = p_path['created'].astype(str).str[:10].unique()
+            all_dates.update(path_dates)
+
+        if not all_dates:
+            if project_id in gc_metadata:
+                st.info(f"No open access imaging found. This project ({project_id}) has controlled-access data in General Commons.")
+                st.markdown(f"Please follow the [TCIA Controlled Data Access Policy](https://www.cancerimagingarchive.net/nih-controlled-data-access-policy/) to request access.")
+            else:
+                st.info("No radiology or pathology imaging found for this patient.")
+        else:
+            if project_id in gc_metadata:
+                st.warning(f"Note: This patient belongs to project {project_id} which contains both open access and controlled access data. Only open access data is shown here.")
+
+            # Sort dates, keep 'Unknown' and 'Pathology' at the end
+            date_list = list(all_dates)
+            special = [d for d in date_list if d in ['Unknown', 'Pathology']]
+            regular = sorted([d for d in date_list if d not in ['Unknown', 'Pathology']], reverse=True)
+            sorted_dates = regular + sorted(special)
+
+            for date in sorted_dates:
+                with st.expander(f"Study Date: {date}"):
+                    # Radiology Series
+                    rad_series = p_idc[p_idc['StudyDate'] == date] if not p_idc.empty else pd.DataFrame()
+                    if not rad_series.empty:
+                        st.write("**Radiology (IDC - Open Access)**")
+                        for _, s_row in rad_series.iterrows():
+                            if s_row['Modality'] == 'SM':
+                                view_url = f"https://viewer.imaging.datacommons.cancer.gov/slim/studies/{s_row['StudyInstanceUID']}/series/{s_row['SeriesInstanceUID']}"
+                                view_label = "View in SliM"
+                            else:
+                                view_url = f"https://viewer.imaging.datacommons.cancer.gov/v3/viewer/?StudyInstanceUIDs={s_row['StudyInstanceUID']}&SeriesInstanceUIDs={s_row['SeriesInstanceUID']}"
+                                view_label = "View in OHIF"
+                            st.markdown(f"- **{s_row['Modality']}**: {s_row['SeriesDescription']} ([{view_label}]({view_url}))")
+
+                    # Pathology Images
+                    path_imgs = p_path[p_path['created'].astype(str).str[:10] == date] if not p_path.empty else pd.DataFrame()
+                    if not path_imgs.empty:
+                        st.write("**Pathology (PathDB - Open Access)**")
+                        for _, p_row in path_imgs.iterrows():
+                            view_url = f"https://pathdb.cancerimagingarchive.net/caMicroscope/apps/mini/viewer.html?mode=pathdb&slideId={p_row['slideId']}"
+                            st.markdown(f"- **{p_row['imageId']}** ([View in caMicroscope]({view_url}))")
+
+    with col_detail2:
         st.write("**Patient Metadata Summary**")
         p_meta = filtered_df[filtered_df['Case ID'] == patient_id].iloc[0]
         st.json(p_meta.to_dict())
-    else:
-        col_detail1, col_detail2 = st.columns([1, 2])
-
-        with col_detail1:
-            st.write("**Studies & Images**")
-
-            # Get radiology data for this patient
-            p_idc = idc_data[idc_data['PatientID'] == patient_id] if not idc_data.empty else pd.DataFrame()
-            # Get pathology data for this patient
-            p_path = pathology_data[pathology_data['Case ID'] == patient_id] if pathology_data is not None else pd.DataFrame()
-
-            # Combine all unique dates
-            all_dates = set()
-            if not p_idc.empty:
-                all_dates.update(p_idc['StudyDate'].unique())
-
-            if not p_path.empty:
-                # Try to use 'created' date from pathology metadata if possible
-                path_dates = p_path['created'].astype(str).str[:10].unique()
-                all_dates.update(path_dates)
-
-            if not all_dates:
-                st.info("No radiology or pathology imaging found for this patient.")
-            else:
-                # Sort dates, keep 'Unknown' and 'Pathology' at the end
-                date_list = list(all_dates)
-                special = [d for d in date_list if d in ['Unknown', 'Pathology']]
-                regular = sorted([d for d in date_list if d not in ['Unknown', 'Pathology']], reverse=True)
-                sorted_dates = regular + sorted(special)
-
-                for date in sorted_dates:
-                    with st.expander(f"Study Date: {date}"):
-                        # Radiology Series
-                        rad_series = p_idc[p_idc['StudyDate'] == date] if not p_idc.empty else pd.DataFrame()
-                        if not rad_series.empty:
-                            st.write("**Radiology (IDC)**")
-                            for _, s_row in rad_series.iterrows():
-                                if s_row['Modality'] == 'SM':
-                                    view_url = f"https://viewer.imaging.datacommons.cancer.gov/slim/studies/{s_row['StudyInstanceUID']}/series/{s_row['SeriesInstanceUID']}"
-                                    view_label = "View in SliM"
-                                else:
-                                    view_url = f"https://viewer.imaging.datacommons.cancer.gov/v3/viewer/?StudyInstanceUIDs={s_row['StudyInstanceUID']}&SeriesInstanceUIDs={s_row['SeriesInstanceUID']}"
-                                    view_label = "View in OHIF"
-                                st.markdown(f"- **{s_row['Modality']}**: {s_row['SeriesDescription']} ([{view_label}]({view_url}))")
-
-                        # Pathology Images
-                        path_imgs = p_path[p_path['created'].astype(str).str[:10] == date] if not p_path.empty else pd.DataFrame()
-                        if not path_imgs.empty:
-                            st.write("**Pathology (PathDB)**")
-                            for _, p_row in path_imgs.iterrows():
-                                view_url = f"https://pathdb.cancerimagingarchive.net/caMicroscope/apps/mini/viewer.html?mode=pathdb&slideId={p_row['slideId']}"
-                                st.markdown(f"- **{p_row['imageId']}** ([View in caMicroscope]({view_url}))")
-
-        with col_detail2:
-            st.write("**Patient Metadata Summary**")
-            p_meta = filtered_df[filtered_df['Case ID'] == patient_id].iloc[0]
-            st.json(p_meta.to_dict())
 
 # --- Exports ---
 
@@ -418,10 +429,11 @@ if st.button("Prepare Download Bundle (ZIP)"):
             )
 
             # Show controlled access warning if relevant
-            controlled_projects = [p for p in filtered_df['Project Short Name'].unique() if wp_metadata.get(p, {}).get('is_controlled')]
+            controlled_projects = [p for p in filtered_df['Project Short Name'].unique() if p in gc_metadata]
             if controlled_projects:
-                st.warning(f"Note: This cohort contains controlled access data from: {', '.join(controlled_projects)}. "
-                           "Ensure you have authorized access from TCIA to use these datasets.")
+                st.warning(f"Note: This cohort contains controlled access data from General Commons for projects: {', '.join(controlled_projects)}. "
+                           "The ZIP bundle only contains metadata for open access data found in IDC and PathDB. "
+                           "Ensure you have authorized access from TCIA to use controlled datasets.")
 
         except Exception as e:
             st.error(f"Error generating bundle: {e}")
@@ -433,8 +445,8 @@ v_col1, v_col2 = st.columns(2)
 
 with v_col1:
     diag_counts = filtered_df['Primary Diagnosis'].value_counts()
-    st.plotly_chart(px.bar(diag_counts, title="Distribution of Diagnoses"), use_container_width=True)
+    st.plotly_chart(px.bar(diag_counts, title="Distribution of Diagnoses"))
 
 with v_col2:
     site_counts = filtered_df['Primary Site'].value_counts()
-    st.plotly_chart(px.pie(values=site_counts.values, names=site_counts.index, title="Distribution of Primary Sites"), use_container_width=True)
+    st.plotly_chart(px.pie(values=site_counts.values, names=site_counts.index, title="Distribution of Primary Sites"))
