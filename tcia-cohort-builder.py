@@ -13,6 +13,7 @@ import time
 from io import BytesIO
 import xlsxwriter
 from io import StringIO
+import zipfile
 
 # --- Custom CSS ---
 st.markdown("""
@@ -57,102 +58,23 @@ def load_pathology_data():
 @st.cache_data
 def load_wp_metadata():
     try:
-        # Fetching v2 metadata to get license details
-        # Using a custom fetch because tcia_utils might not support v2/v=1 yet
-        def fetch_v2(endpoint):
-            base_url = f"https://cancerimagingarchive.net/api/v2/{endpoint}?per_page=100&v=1"
-            all_results = []
-            try:
-                r = requests.get(base_url, timeout=30)
-                r.raise_for_status()
-                data = r.json()
-                all_results.extend(data.get('results', []))
-                total_pages = int(data.get('total_pages', 1))
-                if total_pages > 1:
-                    for p in range(2, total_pages + 1):
-                        r = requests.get(f"{base_url}&page={p}", timeout=30)
-                        r.raise_for_status()
-                        all_results.extend(r.json().get('results', []))
-            except Exception as e:
-                st.warning(f"Error fetching {endpoint}: {e}")
-            return all_results
-
-        c_v2 = fetch_v2('collections')
-        a_v2 = fetch_v2('analysis-results')
-
-        wp_metadata = {}
-
-        def process_v2(results, is_collection=True):
-            short_title_key = 'collection_short_title' if is_collection else 'result_short_title'
-            doi_key = 'collection_doi' if is_collection else 'result_doi'
-            downloads_key = 'collection_downloads' if is_collection else 'result_downloads'
-
-            for item in results:
-                short_title = str(item.get(short_title_key, ""))
-                if not short_title or short_title == "nan":
-                    continue
-
-                # Check for controlled access in downloads license info
-                downloads = item.get(downloads_key, [])
-                is_controlled = False
-                licenses = []
-                if isinstance(downloads, list):
-                    for d in downloads:
-                        if isinstance(d, dict):
-                            l_info = d.get('license', {})
-                            l_label = str(l_info.get('label', '') if isinstance(l_info, dict) else l_info).lower()
-                            licenses.append(l_label)
-                            if any(term in l_label for term in ['controlled', 'restricted', 'limited', 'usage agreement', 'dbgap']):
-                                is_controlled = True
-
-                # Fallback to old field if no licenses found
-                if not licenses:
-                    access = str(item.get('collection_page_accessibility', '')).lower()
-                    if any(term in access for term in ['controlled', 'restricted', 'limited']):
-                        is_controlled = True
-
-                wp_metadata[short_title] = {
-                    'is_controlled': is_controlled,
-                    'link': item.get('url', ''),
-                    'doi': item.get(doi_key, ''),
-                    'species': str(item.get('species', '')),
-                    'cancer_types': str(item.get('cancer_types', '')),
-                    'licenses': "; ".join(licenses)
-                }
-
-        process_v2(c_v2, True)
-        process_v2(a_v2, False)
-
-        return wp_metadata
+        if os.path.exists('wp_metadata.parquet'):
+            df = pd.read_parquet('wp_metadata.parquet')
+            return df.set_index('short_title').to_dict('index')
+        return {}
     except Exception as e:
-        st.warning(f"Error loading WordPress metadata: {e}")
+        st.warning(f"Error loading WordPress metadata from parquet: {e}")
         return {}
 
 @st.cache_data
 def load_idc_metadata(project_list):
     try:
-        client = IDCClient()
-        # Map project names to IDC collection IDs
-        idc_collections = [p.lower().replace('-', '_') for p in project_list]
+        if os.path.exists('idc_metadata.parquet'):
+            df = pd.read_parquet('idc_metadata.parquet')
+            # Map project names to IDC collection IDs
+            idc_collections = [p.lower().replace('-', '_') for p in project_list]
+            df = df[df['collection_id'].isin(idc_collections)]
 
-        query = f"""
-        SELECT
-            collection_id,
-            PatientID,
-            StudyInstanceUID,
-            StudyDate,
-            StudyDescription,
-            BodyPartExamined,
-            SeriesInstanceUID,
-            Modality,
-            SeriesDescription,
-            instanceCount,
-            series_size_MB
-        FROM index
-        WHERE collection_id IN ({','.join([repr(c) for c in idc_collections])})
-        """
-        df = client.sql_query(query)
-        if df is not None and not df.empty:
             # Normalize StudyDate to YYYY-MM-DD
             def normalize_date(d):
                 d = str(d)
@@ -162,9 +84,10 @@ def load_idc_metadata(project_list):
                     return f"{d[:4]}-{d[4:6]}-{d[6:]}"
                 return d
             df['StudyDate'] = df['StudyDate'].apply(normalize_date)
-        return df
+            return df
+        return pd.DataFrame()
     except Exception as e:
-        st.error(f"Error loading IDC metadata: {e}")
+        st.error(f"Error loading IDC metadata from parquet: {e}")
         return pd.DataFrame()
 
 # --- Helper Functions ---
@@ -448,54 +371,55 @@ if st.session_state.selected_patient:
 # --- Exports ---
 
 st.divider()
-st.subheader("3. Export Cohort")
-e_col1, e_col2, e_col3 = st.columns(3)
+st.subheader("3. Export Cohort Bundle")
 
-with e_col1:
-    st.download_button(
-        "Download Clinical CSV",
-        filtered_df.to_csv(index=False),
-        "cohort_clinical.csv",
-        "text/csv"
-    )
+if st.button("Prepare Download Bundle (ZIP)"):
+    with st.spinner("Generating bundle..."):
+        try:
+            zip_buffer = BytesIO()
+            with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+                # 1. Clinical Data
+                zip_file.writestr("clinical_data.csv", filtered_df.to_csv(index=False))
 
-with e_col2:
-    if st.button("Generate Radiology Manifest"):
-        # Filtered patients
-        # Check if any controlled access projects are in the filtered cohort
-        controlled_projects = [p for p in filtered_df['Project Short Name'].unique() if wp_metadata.get(p, {}).get('is_controlled')]
-        if controlled_projects:
-            st.info(f"Note: Cohort contains controlled access data from: {', '.join(controlled_projects)}. Ensure you have appropriate permissions.")
+                # 2. Radiology Data (Full Metadata)
+                patient_ids = filtered_df['Case ID'].unique()
+                rad_meta = idc_data[idc_data['PatientID'].isin(patient_ids)]
+                if not rad_meta.empty:
+                    zip_file.writestr("radiology_metadata.csv", rad_meta.to_csv(index=False))
 
-        ids = filtered_df['Case ID'].unique()
-        uids = idc_data[idc_data['PatientID'].isin(ids)]['SeriesInstanceUID'].unique()
-        if len(uids) > 0:
-            m_df = pd.DataFrame({'SeriesInstanceUID': uids})
+                # 3. Pathology Data
+                path_manifest = generate_pathology_manifest(filtered_df, pathology_data)
+                if not path_manifest.empty:
+                    zip_file.writestr("pathology_metadata.csv", path_manifest.to_csv(index=False))
+
+                # 4. Visualization Plots
+                # Diagnoses Plot
+                diag_counts = filtered_df['Primary Diagnosis'].value_counts()
+                fig_diag = px.bar(diag_counts, title="Distribution of Diagnoses")
+                img_diag = fig_diag.to_image(format="png")
+                zip_file.writestr("visualizations/diagnoses_distribution.png", img_diag)
+
+                # Sites Plot
+                site_counts = filtered_df['Primary Site'].value_counts()
+                fig_site = px.pie(values=site_counts.values, names=site_counts.index, title="Distribution of Primary Sites")
+                img_site = fig_site.to_image(format="png")
+                zip_file.writestr("visualizations/sites_distribution.png", img_site)
+
             st.download_button(
-                "Download Radiology Manifest (CSV)",
-                m_df.to_csv(index=False),
-                "radiology_manifest.csv",
-                "text/csv"
+                label="Download ZIP Bundle",
+                data=zip_buffer.getvalue(),
+                file_name="tcia_cohort_bundle.zip",
+                mime="application/zip"
             )
-            st.success(f"Generated manifest with {len(uids)} series.")
-        else:
-            st.error("No radiology data found for current cohort.")
 
-with e_col3:
-    if st.button("Generate Pathology Manifest"):
-        p_manifest = generate_pathology_manifest(filtered_df, pathology_data)
-        if not p_manifest.empty:
-            buf = BytesIO()
-            with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
-                p_manifest.to_excel(writer, index=False)
-            st.download_button(
-                "Download Pathology Manifest (Excel)",
-                buf.getvalue(),
-                "pathology_manifest.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        else:
-            st.error("No pathology data found for current cohort.")
+            # Show controlled access warning if relevant
+            controlled_projects = [p for p in filtered_df['Project Short Name'].unique() if wp_metadata.get(p, {}).get('is_controlled')]
+            if controlled_projects:
+                st.warning(f"Note: This cohort contains controlled access data from: {', '.join(controlled_projects)}. "
+                           "Ensure you have authorized access from TCIA to use these datasets.")
+
+        except Exception as e:
+            st.error(f"Error generating bundle: {e}")
 
 # --- Visualizations ---
 st.divider()
