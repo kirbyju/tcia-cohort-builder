@@ -109,33 +109,86 @@ def fetch_idc_metadata():
 def fetch_gc_metadata():
     print("Fetching General Commons metadata...")
     endpoint = "https://general.datacommons.cancer.gov/v1/graphql/"
-    phs = "phs004225"
-    query = """
+
+    # 1. Fetch study acronyms
+    query_studies = """
     query TCIAStudies($phs: [String], $first: Int) {
       studies(phs_accessions: $phs, first: $first) {
         study_acronym
       }
     }
     """
-    payload = json.dumps({"query": query, "variables": {"phs": ["phs004225"], "first": 10000}}).encode("utf-8")
-    request = urllib.request.Request(
-        endpoint,
-        data=payload,
-        headers={"Content-Type": "application/json", "User-Agent": "tcia-query-skill/1.0"},
-        method="POST",
-    )
-    try:
+
+    def post_query(query, variables=None):
+        payload = json.dumps({"query": query, "variables": variables}).encode("utf-8")
+        request = urllib.request.Request(
+            endpoint,
+            data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "tcia-query-skill/1.0"},
+            method="POST",
+        )
         with urllib.request.urlopen(request, timeout=60) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            studies = result.get("data", {}).get("studies", [])
-            df = pd.DataFrame(studies)
-            if not df.empty:
-                df.to_parquet('gc_metadata.parquet')
-                print(f"Saved {len(df)} GC study acronyms.")
-            else:
-                print("No GC studies found.")
+            return json.loads(response.read().decode("utf-8"))
+
+    try:
+        res_studies = post_query(query_studies, {"phs": ["phs004225"], "first": 1000})
+        studies = res_studies.get("data", {}).get("studies", [])
+        df_studies = pd.DataFrame(studies)
+        if not df_studies.empty:
+            df_studies.to_parquet('gc_metadata.parquet')
+            print(f"Saved {len(df_studies)} GC study acronyms.")
     except Exception as e:
-        print(f"Error fetching GC metadata: {e}")
+        print(f"Error fetching GC studies: {e}")
+
+    # 2. Fetch file metadata for phs004225
+    print("Fetching GC file metadata (this may take a while)...")
+    all_files = []
+    first = 10000
+    offset = 0
+    query_files = """
+    query GCFiles($phs: String!, $first: Int, $offset: Int) {
+      files(phs_accession: $phs, first: $first, offset: $offset) {
+        file_name
+        file_type
+        participant_ids
+      }
+    }
+    """
+
+    try:
+        while True:
+            print(f"Requesting files with offset {offset}...")
+            res_files = post_query(query_files, {"phs": "phs004225", "first": first, "offset": offset})
+            if 'errors' in res_files:
+                print(f"Error in response: {res_files['errors']}")
+                break
+            files = res_files.get("data", {}).get("files", [])
+            if not files:
+                print("No more files found.")
+                break
+            all_files.extend(files)
+            print(f"Fetched {len(all_files)} total files...")
+            if len(files) < first:
+                print("Last page reached.")
+                break
+            offset += first
+
+        if all_files:
+            # Flatten participant_ids for easier searching later
+            flattened = []
+            for f in all_files:
+                p_ids = f.get('participant_ids', [])
+                if not p_ids:
+                    flattened.append({'file_name': f['file_name'], 'file_type': f['file_type'], 'participant_id': None})
+                else:
+                    for pid in p_ids:
+                        flattened.append({'file_name': f['file_name'], 'file_type': f['file_type'], 'participant_id': pid})
+
+            df_files = pd.DataFrame(flattened)
+            df_files.to_parquet('gc_files.parquet')
+            print(f"Saved {len(df_files)} GC file records.")
+    except Exception as e:
+        print(f"Error fetching GC files: {e}")
 
 if __name__ == "__main__":
     fetch_wp_metadata()
