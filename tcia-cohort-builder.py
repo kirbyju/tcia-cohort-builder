@@ -1,485 +1,816 @@
-import streamlit as st
+"""TCIA Cohort Builder v2: patient-centric multi-source cohort discovery."""
 
-# Set page to wide layout
-st.set_page_config(layout="wide", page_title="TCIA Cohort Builder")
+from __future__ import annotations
+
+import logging
+from pathlib import Path
 
 import pandas as pd
-import plotly.express as px
-from idc_index import IDCClient
-import requests
-import os
-import time
-from io import BytesIO
-import xlsxwriter
-from io import StringIO
-import zipfile
+import streamlit as st
 
-# --- Custom CSS ---
-st.markdown("""
-    <style>
-    .main .block-container {
-        max-width: 95%;
-        padding-top: 1rem;
-    }
-    .stDataFrame {
-        width: 100%;
-    }
-    .controlled-access {
-        color: #ff4b4b;
-        font-weight: bold;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-# --- Data Loading and Caching ---
-
-@st.cache_data
-def load_clinical_data():
-    try:
-        df = pd.read_excel("https://github.com/kirbyju/tcia-cohort-builder/raw/refs/heads/main/crdc-clinical.xlsx")
-        for col in df.columns:
-            if col not in ['Age at Diagnosis', 'Age at Surgery', 'Age at Enrollment']:
-                df[col] = df[col].astype(str)
-        df = calculate_age_at_baseline(df)
-        return df
-    except Exception as e:
-        st.error(f"Error loading clinical data: {e}")
-        return None
-
-@st.cache_data
-def load_pathology_data():
-    try:
-        return pd.read_excel("https://github.com/kirbyju/tcia-cohort-builder/raw/refs/heads/main/pathology_image_metadata.xlsx")
-    except Exception as e:
-        st.error(f"Error loading pathology data: {e}")
-        return None
-
-@st.cache_data
-def load_wp_metadata():
-    try:
-        if os.path.exists('wp_metadata.parquet'):
-            df = pd.read_parquet('wp_metadata.parquet')
-            return df.set_index('short_title').to_dict('index')
-        return {}
-    except Exception as e:
-        st.warning(f"Error loading WordPress metadata from parquet: {e}")
-        return {}
-
-@st.cache_data
-def load_gc_metadata():
-    try:
-        acronyms = []
-        files = pd.DataFrame()
-        if os.path.exists('gc_metadata.parquet'):
-            df = pd.read_parquet('gc_metadata.parquet')
-            acronyms = df['study_acronym'].tolist()
-        if os.path.exists('gc_files.parquet'):
-            files = pd.read_parquet('gc_files.parquet')
-        return acronyms, files
-    except Exception as e:
-        st.warning(f"Error loading General Commons metadata from parquet: {e}")
-        return [], pd.DataFrame()
-
-@st.cache_data
-def load_idc_metadata(project_list):
-    try:
-        if os.path.exists('idc_metadata.parquet'):
-            df = pd.read_parquet('idc_metadata.parquet')
-            # Map project names to IDC collection IDs
-            idc_collections = [p.lower().replace('-', '_') for p in project_list]
-            df = df[df['collection_id'].isin(idc_collections)]
-
-            # Normalize StudyDate to YYYY-MM-DD
-            def normalize_date(d):
-                d = str(d)
-                if d in ['None', 'nan', '', 'NaN']:
-                    return 'Unknown'
-                if len(d) == 8 and d.isdigit():
-                    return f"{d[:4]}-{d[4:6]}-{d[6:]}"
-                return d
-            df['StudyDate'] = df['StudyDate'].apply(normalize_date)
-            return df
-        return pd.DataFrame()
-    except Exception as e:
-        st.error(f"Error loading IDC metadata from parquet: {e}")
-        return pd.DataFrame()
-
-# --- Helper Functions ---
-
-age_uom_factors = {
-    'Year': 1.0,
-    'Month': 1/12,
-    'Day': 1/365.25,
-}
-
-def calculate_age_at_baseline(df, age_columns=['Age at Diagnosis', 'Age at Surgery', 'Age at Enrollment'], uom_column='Age UOM'):
-    df = df.copy()
-    for col in age_columns:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    df['Age at Baseline'] = pd.NA
-    if uom_column in df.columns:
-        df['UOM_factor'] = df[uom_column].str.lower().str.strip()
-        df['UOM_factor'] = df['UOM_factor'].map(lambda x:
-            age_uom_factors.get('Year') if 'year' in str(x) else
-            age_uom_factors.get('Month') if 'month' in str(x) else
-            age_uom_factors.get('Day') if 'day' in str(x) else
-            1.0
-        )
-    else:
-        df['UOM_factor'] = 1.0
-
-    existing_age_columns = [col for col in age_columns if col in df.columns]
-    for age_col in existing_age_columns:
-        df[f'{age_col}_years'] = df[age_col] * df['UOM_factor']
-
-    converted_cols = [f'{col}_years' for col in existing_age_columns]
-    if converted_cols:
-        df['Age at Baseline'] = df[converted_cols].min(axis=1)
-    df = df.drop(columns=[c for c in converted_cols if c in df.columns] + ['UOM_factor'])
-    df['Age at Baseline'] = pd.to_numeric(df['Age at Baseline'], errors='coerce').round(1)
-    return df
-
-def get_unique_sorted_values(df, column):
-    try:
-        if column not in df.columns:
-            return []
-        vals = df[column].dropna().unique().tolist()
-        return sorted([str(v) for v in vals])
-    except Exception:
-        return []
-
-@st.cache_data
-def filter_dataframe(df, filters, age_range=None, is_default_age_range=True):
-    if df.empty:
-        return df
-    filtered_df = df.copy()
-    for column, values in filters.items():
-        if values:
-            filtered_df = filtered_df[filtered_df[column].isin(values)]
-
-    if age_range and 'Age at Baseline' in filtered_df.columns and not is_default_age_range:
-        min_age, max_age = age_range
-        # Filter numeric values
-        mask = (filtered_df['Age at Baseline'] >= min_age) & (filtered_df['Age at Baseline'] <= max_age)
-        if min_age == 0:
-            # Include NaN if min_age is 0
-            mask = mask | filtered_df['Age at Baseline'].isna()
-        filtered_df = filtered_df[mask]
-    return filtered_df
-
-def generate_pathology_manifest(filtered_df, pathology_data):
-    if pathology_data is None:
-        return pd.DataFrame()
-    required_columns = ['Case ID', 'imageId', 'slideId', 'imageHeight', 'imagedWidth', 'physicalPixelSizeX', 'physicalPixelSizeY', 'imageUrl', 'created', 'changed']
-    filtered_case_ids = filtered_df['Case ID'].unique()
-    pathology_manifest = pathology_data[
-        pathology_data['Case ID'].isin(filtered_case_ids)
-    ].copy()
-    # Only keep requested columns if they exist
-    cols_to_keep = [c for c in required_columns if c in pathology_manifest.columns]
-    pathology_manifest = pathology_manifest[cols_to_keep]
-    merged_manifest = filtered_df[['Project Short Name', 'Case ID']].merge(pathology_manifest, on='Case ID', how='inner')
-    return merged_manifest
-
-# --- Page Content ---
-
-st.title('TCIA Cohort Builder')
-
-# Load data
-df_clin = load_clinical_data()
-if df_clin is None:
-    st.stop()
-
-pathology_data = load_pathology_data()
-wp_metadata = load_wp_metadata()
-gc_metadata, gc_files = load_gc_metadata()
-# Only load IDC metadata for projects present in clinical data
-all_projects = df_clin['Project Short Name'].unique()
-idc_data = load_idc_metadata(all_projects)
-
-# Sidebar Filters
-st.sidebar.header("Filters")
-filters = {}
-
-with st.sidebar.expander("Image and Project Filters"):
-    filters['Available Images'] = st.multiselect('Available Images', options=get_unique_sorted_values(df_clin, 'Available Images'))
-
-    # Modality and Body Part filters from IDC data
-    if not idc_data.empty:
-        # Modality
-        all_modalities = get_unique_sorted_values(idc_data, 'Modality')
-        if pathology_data is not None:
-            all_modalities.append('Pathology')
-        selected_modalities = st.multiselect('Modality', options=sorted(list(set(all_modalities))))
-
-        # Body Part
-        all_body_parts = get_unique_sorted_values(idc_data, 'BodyPartExamined')
-        selected_body_parts = st.multiselect('Body Part Examined', options=all_body_parts)
-
-        if selected_modalities or selected_body_parts:
-            # Filter patients based on these attributes
-            filtered_idc = idc_data.copy()
-            if selected_modalities:
-                rad_mods = [m for m in selected_modalities if m != 'Pathology']
-                mask = pd.Series(False, index=filtered_idc.index)
-                if rad_mods:
-                    mask = mask | filtered_idc['Modality'].isin(rad_mods)
-
-                path_patients = set()
-                if 'Pathology' in selected_modalities and pathology_data is not None:
-                    path_patients = set(pathology_data['Case ID'].unique())
-
-                rad_patients = set(filtered_idc[mask]['PatientID'].unique())
-                valid_patients = rad_patients | path_patients
-                df_clin = df_clin[df_clin['Case ID'].isin(valid_patients)]
-                filtered_idc = filtered_idc[filtered_idc['PatientID'].isin(valid_patients)]
-
-            if selected_body_parts:
-                rad_patients = set(filtered_idc[filtered_idc['BodyPartExamined'].isin(selected_body_parts)]['PatientID'].unique())
-                df_clin = df_clin[df_clin['Case ID'].isin(rad_patients)]
-
-    # Species filter from WP metadata
-    if wp_metadata:
-        all_species = sorted(list(set([m['species'] for m in wp_metadata.values() if m.get('species') and m['species'] != 'nan'])))
-        selected_species = st.multiselect('Species', options=all_species)
-        if selected_species:
-            valid_projects = [p for p, m in wp_metadata.items() if m.get('species') in selected_species]
-            df_clin = df_clin[df_clin['Project Short Name'].isin(valid_projects)]
-
-    filters['Project Short Name'] = st.multiselect('Project Short Name', options=get_unique_sorted_values(df_clin, 'Project Short Name'))
-
-with st.sidebar.expander("Demographic Filters"):
-    filters['Race'] = st.multiselect('Race', options=get_unique_sorted_values(df_clin, 'Race'))
-    filters['Ethnicity'] = st.multiselect('Ethnicity', options=get_unique_sorted_values(df_clin, 'Ethnicity'))
-    filters['Sex at Birth'] = st.multiselect('Sex at Birth', options=get_unique_sorted_values(df_clin, 'Sex at Birth'))
-
-with st.sidebar.expander("Clinical Filters"):
-    filters['Primary Diagnosis'] = st.multiselect('Primary Diagnosis', options=get_unique_sorted_values(df_clin, 'Primary Diagnosis'))
-    filters['Primary Site'] = st.multiselect('Primary Site', options=get_unique_sorted_values(df_clin, 'Primary Site'))
-
-# Age Filter
-valid_ages = df_clin['Age at Baseline'].dropna()
-max_age_val = float(valid_ages.max()) if not valid_ages.empty else 100.0
-age_range = st.sidebar.slider('Age at Baseline (years)', 0.0, max_age_val, (0.0, max_age_val), 0.1)
-is_default_age_range = (age_range[0] == 0.0) and (age_range[1] == max_age_val)
-
-filtered_df = filter_dataframe(df_clin, filters, age_range, is_default_age_range)
-
-st.write(f"Showing {len(filtered_df)} patients based on filters.")
-
-# --- Hierarchy: Patient Selection ---
-
-st.subheader("1. Select a Patient")
-
-def get_project_display(project):
-    if project in gc_metadata:
-        return f"⚠️ {project} (Mixed/Controlled)"
-    return project
-
-display_df = filtered_df[['Project Short Name', 'Case ID', 'Available Images', 'Sex at Birth', 'Age at Baseline']].copy()
-display_df['Project'] = display_df['Project Short Name'].apply(get_project_display)
-
-# Reorder columns
-cols = ['Project', 'Case ID', 'Available Images', 'Sex at Birth', 'Age at Baseline']
-display_df = display_df[cols]
-
-# Pagination for the table
-page_size = 10
-total_pages = max(1, (len(display_df) - 1) // page_size + 1)
-page_num = st.number_input("Page", min_value=1, max_value=total_pages, step=1)
-start_idx = (page_num - 1) * page_size
-end_idx = start_idx + page_size
-
-# State for selected patient
-if 'selected_patient' not in st.session_state:
-    st.session_state.selected_patient = None
-
-# Using selection mode in st.dataframe (requires Streamlit >= 1.35.0)
-event = st.dataframe(
-    display_df.iloc[start_idx:end_idx],
-        width="stretch",
-    hide_index=True,
-    on_select="rerun",
-    selection_mode="single-row"
+from cohort_builder_v2_data import (
+    OPEN_ACCESS_LEVELS,
+    POLICY_URL,
+    DataPaths,
+    add_idc_viewer_urls,
+    build_manifest_download,
+    build_patient_index,
+    cart_item,
+    deduplicate_cart,
+    load_dataset_catalog,
+    load_pathology_package_summary,
+    load_patient_clinical_facts,
+    load_patient_controlled,
+    load_patient_idc,
+    load_patient_nifti,
+    load_patient_pathdb,
+    normalize_study_date,
+    resolve_data_paths,
+    split_tokens,
 )
 
-if event and len(event.selection.rows) > 0:
-    row_idx = event.selection.rows[0]
-    st.session_state.selected_patient = display_df.iloc[start_idx + row_idx]['Case ID']
-    st.session_state.selected_project = filtered_df.iloc[start_idx + row_idx]['Project Short Name']
 
-# --- Hierarchy: Study & Series Details ---
+PATIENT_INDEX_SCHEMA_VERSION = 2
 
-if st.session_state.selected_patient:
-    st.divider()
-    patient_id = st.session_state.selected_patient
-    project_id = st.session_state.selected_project
 
-    st.subheader(f"2. Imaging Details for Patient: {patient_id}")
+st.set_page_config(
+    page_title="TCIA Cohort Builder v2",
+    page_icon="🧬",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
-    # Access logic:
-    # 1. If data is in idc_data or pathology_data for this patient, it is open access.
-    # 2. If the project is in gc_metadata, it MIGHT have controlled access data in GC.
+st.markdown(
+    """
+    <style>
+    .main .block-container {max-width: 96%; padding-top: 1.1rem;}
+    [data-testid="stMetricValue"] {font-size: 1.45rem;}
+    .access-note {
+        border-left: 0.35rem solid #d97706;
+        padding: 0.55rem 0.8rem;
+        background: rgba(217, 119, 6, 0.08);
+        margin: 0.4rem 0 0.9rem 0;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-    col_detail1, col_detail2 = st.columns([1, 2])
 
-    with col_detail1:
-        st.write("**Studies & Images**")
+@st.cache_data(
+    show_spinner=(
+        "Building the patient-level index… A cold start processes about one "
+        "million IDC series and can take roughly 30 seconds; later reruns use "
+        "the cached index."
+    )
+)
+def cached_patient_index(paths: DataPaths, signatures: tuple) -> pd.DataFrame:
+    return build_patient_index(paths)
 
-        # Get radiology data for this patient
-        p_idc = idc_data[idc_data['PatientID'] == patient_id] if not idc_data.empty else pd.DataFrame()
-        # Get pathology data for this patient
-        p_path = pathology_data[pathology_data['Case ID'] == patient_id] if pathology_data is not None else pd.DataFrame()
 
-        # Combine all unique dates
-        all_dates = set()
-        if not p_idc.empty:
-            all_dates.update(p_idc['StudyDate'].unique())
+@st.cache_data(show_spinner=False)
+def cached_catalog(paths: DataPaths, signatures: tuple) -> pd.DataFrame:
+    return load_dataset_catalog(paths.snapshot_db)
 
-        if not p_path.empty:
-            # Try to use 'created' date from pathology metadata if possible
-            path_dates = p_path['created'].astype(str).str[:10].unique()
-            all_dates.update(path_dates)
 
-        if not all_dates:
-            if project_id in gc_metadata:
-                st.info(f"No open access imaging found. This project ({project_id}) has controlled-access data in General Commons.")
-                st.markdown(f"Please follow the [TCIA Controlled Data Access Policy](https://www.cancerimagingarchive.net/nih-controlled-data-access-policy/) to request access.")
+def option_values(frame: pd.DataFrame, column: str) -> list[str]:
+    if column not in frame:
+        return []
+    return sorted(
+        {
+            str(value).strip()
+            for value in frame[column].dropna()
+            if str(value).strip()
+        },
+        key=str.casefold,
+    )
+
+
+def token_options(frame: pd.DataFrame, column: str) -> list[str]:
+    if column not in frame:
+        return []
+    values: set[str] = set()
+    for value in frame[column].dropna():
+        values.update(split_tokens(value))
+    return sorted(values, key=str.casefold)
+
+
+def apply_token_filter(
+    frame: pd.DataFrame, column: str, selected: list[str]
+) -> pd.DataFrame:
+    if not selected or column not in frame:
+        return frame
+    wanted = set(selected)
+    return frame[
+        frame[column].map(lambda value: bool(wanted.intersection(split_tokens(value))))
+    ]
+
+
+def add_cart_items(items: list[dict[str, str] | None]) -> int:
+    current = st.session_state.get("cart_items", [])
+    st.session_state.cart_items = deduplicate_cart(
+        current + [item for item in items if item is not None]
+    )
+    return len(st.session_state.cart_items) - len(current)
+
+
+def finish_cart_add(added: int) -> None:
+    if added:
+        st.session_state.cart_notice = f"Added {added} new item(s) to the cart."
+    else:
+        st.session_state.cart_notice = "Those items were already in the cart."
+    # The sidebar was rendered before the detail-tab button was handled. Start
+    # a new run so it immediately reflects the updated session state.
+    st.rerun()
+
+
+def safe_int(value: object) -> int:
+    try:
+        if pd.isna(value):
+            return 0
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def render_cart() -> None:
+    st.sidebar.divider()
+    st.sidebar.subheader("Shopping cart")
+    items = st.session_state.get("cart_items", [])
+    notice = st.session_state.pop("cart_notice", None)
+    if notice:
+        st.sidebar.success(notice)
+    st.sidebar.caption(
+        "The export separates DICOM UIDs, PathDB URLs, and controlled DRS URIs "
+        "so each Data Retriever CSV has one unambiguous route."
+    )
+    if not items:
+        st.sidebar.info("No scans or files have been added.")
+        return
+
+    cart_frame = pd.DataFrame(items)
+    route_counts = cart_frame["manifest_header"].value_counts()
+    st.sidebar.write(
+        " · ".join(f"{header}: {count}" for header, count in route_counts.items())
+    )
+    remove_ids = st.sidebar.multiselect(
+        "Remove items",
+        options=cart_frame["item_id"].tolist(),
+        format_func=lambda item_id: cart_frame.loc[
+            cart_frame["item_id"] == item_id, "label"
+        ].iloc[0],
+    )
+    remove_col, clear_col = st.sidebar.columns(2)
+    if remove_col.button("Remove", disabled=not remove_ids, use_container_width=True):
+        st.session_state.cart_items = [
+            item for item in items if item["item_id"] not in set(remove_ids)
+        ]
+        st.rerun()
+    if clear_col.button("Clear", use_container_width=True):
+        st.session_state.cart_items = []
+        st.rerun()
+
+    payload, filename, mime, counts = build_manifest_download(items)
+    st.sidebar.download_button(
+        "Download Data Retriever manifest",
+        data=payload,
+        file_name=filename,
+        mime=mime,
+        use_container_width=True,
+        type="primary",
+    )
+    if "drs_uri" in counts:
+        st.sidebar.warning(
+            "Controlled DRS files require authorization and TCIA Data Retriever "
+            "API-key configuration."
+        )
+
+
+def render_patient_summary(patient: pd.Series) -> None:
+    metrics = st.columns(5)
+    metrics[0].metric("DICOM series", safe_int(patient.get("dicom_series", 0)))
+    metrics[1].metric("NIfTI files", safe_int(patient.get("nifti_files", 0)))
+    metrics[2].metric("PathDB slides", safe_int(patient.get("pathdb_slides", 0)))
+    metrics[3].metric("Controlled files", safe_int(patient.get("controlled_files", 0)))
+    metrics[4].metric("Clinical conflicts", safe_int(patient.get("conflict_count", 0)))
+
+    summary_columns = [
+        "short_title",
+        "subject_id",
+        "resolved_access_level",
+        "sex_at_birth",
+        "race",
+        "ethnicity",
+        "age_at_baseline",
+        "primary_diagnosis",
+        "primary_site",
+        "stage",
+        "grade",
+        "vital_status",
+        "response",
+        "screening_result",
+        "source_kinds",
+        "available_imaging",
+        "modalities",
+        "body_parts",
+    ]
+    summary = {
+        column: patient.get(column)
+        for column in summary_columns
+        if column in patient.index and pd.notna(patient.get(column))
+    }
+    st.json(summary)
+
+    if safe_int(patient.get("primary_diagnosis_is_inferred", 0)):
+        st.caption(
+            "Primary diagnosis is a dataset-scope fallback, not a confirmed "
+            "patient-level observation."
+        )
+    if safe_int(patient.get("primary_site_is_inferred", 0)):
+        st.caption(
+            "Primary site is a dataset-scope fallback, not a confirmed "
+            "patient-level observation."
+        )
+
+
+def selectable_cart_table(
+    frame: pd.DataFrame,
+    display_columns: list[str],
+    *,
+    key: str,
+    button_label: str,
+    item_builder,
+) -> None:
+    if frame.empty:
+        return
+    shown = frame.reset_index(drop=True).copy()
+    shown.insert(0, "Add", False)
+    edited = st.data_editor(
+        shown[["Add"] + display_columns],
+        hide_index=True,
+        width="stretch",
+        disabled=display_columns,
+        key=key,
+        column_config={
+            "Add": st.column_config.CheckboxColumn(required=True),
+            "viewer_url": st.column_config.LinkColumn(
+                "Viewer", display_text="Open viewer"
+            ),
+            "imageUrl": st.column_config.LinkColumn(
+                "Image URL", display_text="Open file"
+            ),
+            "drs_uri": st.column_config.TextColumn("DRS URI"),
+        },
+    )
+    selected = edited.index[edited["Add"]].tolist()
+    if st.button(button_label, disabled=not selected, key=f"{key}_button"):
+        added = add_cart_items(
+            [item_builder(shown.iloc[index]) for index in selected]
+        )
+        finish_cart_add(added)
+
+
+def render_dicom(
+    frame: pd.DataFrame, patient: pd.Series, access_level: str
+) -> None:
+    if frame.empty:
+        st.info("No IDC DICOM series were found for this patient.")
+        return
+    viewable = add_idc_viewer_urls(frame, access_level)
+    timepoints = sorted(viewable["study_date"].unique(), reverse=True)
+    st.caption(f"{len(timepoints)} imaging time point(s), {len(viewable)} series.")
+    if access_level == "controlled":
+        st.warning(
+            "The current TCIA dataset-level download is controlled, but the "
+            "series listed below are independently present in IDC's public "
+            "index and remain available through IDC."
+        )
+    elif access_level == "mixed":
+        st.warning(
+            "The dataset has mixed access. Viewer/cart actions below apply only "
+            "to the series present in the IDC-derived public index."
+        )
+    columns = [
+        "study_date",
+        "Modality",
+        "StudyDescription",
+        "SeriesDescription",
+        "BodyPartExamined",
+        "instanceCount",
+        "series_size_MB",
+        "SeriesInstanceUID",
+        "viewer_url",
+    ]
+    columns = [column for column in columns if column in viewable]
+    st.dataframe(
+        viewable[columns],
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "viewer_url": st.column_config.LinkColumn(
+                "Viewer", display_text="Open viewer"
+            )
+        },
+    )
+    if st.button(
+        "Add all of this patient's public DICOM series",
+        key=f"add_dicom_{patient['patient_key']}",
+    ):
+        added = add_cart_items(
+            [
+                cart_item(
+                    "dicom",
+                    row["SeriesInstanceUID"],
+                    short_title=patient["short_title"],
+                    subject_id=patient["subject_id"],
+                    label=f"{row.get('Modality', 'DICOM')} · {row.get('SeriesDescription', '')}",
+                    source="IDC",
+                    access_level="open",
+                )
+                for _, row in viewable.iterrows()
+            ]
+        )
+        finish_cart_add(added)
+
+
+def render_pathdb(
+    frame: pd.DataFrame, patient: pd.Series, access_level: str
+) -> None:
+    if frame.empty:
+        st.info("No PathDB slide rows were found for this patient.")
+        return
+    shown = frame.copy()
+    if access_level == "controlled":
+        shown["viewer_url"] = ""
+        shown["imageUrl"] = ""
+        st.warning("Public PathDB viewer/download routes are suppressed.")
+    columns = [
+        "slide_id",
+        "modality",
+        "data_format",
+        "cancer_type",
+        "cancer_location",
+        "magnification",
+        "update",
+        "viewer_url",
+        "imageUrl",
+    ]
+    selectable_cart_table(
+        shown,
+        [column for column in columns if column in shown],
+        key=f"pathdb_{patient['patient_key']}",
+        button_label="Add selected PathDB files",
+        item_builder=lambda row: cart_item(
+            "pathdb",
+            row.get("imageUrl"),
+            short_title=patient["short_title"],
+            subject_id=patient["subject_id"],
+            label=f"PathDB · {row.get('slide_id', '')}",
+            source="PathDB",
+            access_level=access_level,
+        ),
+    )
+
+
+def render_nifti(frame: pd.DataFrame) -> None:
+    if frame.empty:
+        st.info("No NIfTI file rows were found for this patient.")
+        return
+    shown = frame.copy()
+    shown["timepoint"] = shown["study_date"].map(normalize_study_date)
+    columns = [
+        "timepoint",
+        "modality",
+        "body_part_examined",
+        "study_description",
+        "series_description",
+        "file_name",
+        "package_path",
+        "study_id_source",
+        "series_id_source",
+        "is_derived_object",
+        "quality_flag_json",
+    ]
+    st.dataframe(
+        shown[[column for column in columns if column in shown]],
+        hide_index=True,
+        width="stretch",
+    )
+    st.caption(
+        "The NIfTI SQLite supplies mined file metadata but not a validated "
+        "Data Retriever route for these package paths, so these rows are not "
+        "added to the manifest cart."
+    )
+
+
+def render_controlled(frame: pd.DataFrame, patient: pd.Series) -> None:
+    if frame.empty:
+        st.info("No controlled-access file metadata were found for this patient.")
+        return
+    st.markdown(
+        f'<div class="access-note"><strong>Controlled access:</strong> Metadata '
+        f'is visible, but files require authorization. Review the '
+        f'<a href="{POLICY_URL}">TCIA policy</a>. No public viewer links are '
+        "created.</div>",
+        unsafe_allow_html=True,
+    )
+    shown = frame.copy()
+    shown["timepoint"] = shown["study_date"].map(normalize_study_date)
+    columns = [
+        "timepoint",
+        "route_system",
+        "modality",
+        "study_description",
+        "series_description",
+        "file_name",
+        "file_type",
+        "file_size_bytes",
+        "drs_uri",
+    ]
+    selectable_cart_table(
+        shown[shown["drs_uri"].fillna("").astype(str).str.strip() != ""],
+        [column for column in columns if column in shown],
+        key=f"controlled_{patient['patient_key']}",
+        button_label="Add selected authorized DRS items",
+        item_builder=lambda row: cart_item(
+            "drs",
+            row.get("drs_uri"),
+            short_title=patient["short_title"],
+            subject_id=patient["subject_id"],
+            label=f"Controlled · {row.get('file_name', '')}",
+            source=str(row.get("route_system", "controlled")),
+            access_level="controlled",
+        ),
+    )
+
+
+def main() -> None:
+    st.title("TCIA Cohort Builder v2")
+    st.caption(
+        "Patient-level clinical filtering with public DICOM, NIfTI, PathDB, "
+        "pathology package, and controlled-access metadata."
+    )
+
+    paths = resolve_data_paths(Path(__file__).resolve().parent)
+    signatures = paths.signatures()
+    patient_index_cache_key = (PATIENT_INDEX_SCHEMA_VERSION, signatures)
+    if not paths.snapshot_db.exists():
+        st.error(
+            f"TCIA snapshot not found at {paths.snapshot_db}. Set "
+            "`TCIA_QUERY_SKILL_ROOT` or `TCIA_SNAPSHOT_DB`, then run "
+            "`python scripts/tcia_snapshot.py ensure` in tcia-query-skill."
+        )
+        st.stop()
+
+    try:
+        patients = cached_patient_index(paths, patient_index_cache_key)
+        catalog = cached_catalog(paths, signatures)
+    except Exception as exc:
+        st.exception(exc)
+        st.stop()
+
+    if "cart_items" not in st.session_state:
+        st.session_state.cart_items = []
+
+    with st.sidebar.expander("Metadata sources", expanded=False):
+        st.dataframe(
+            pd.DataFrame(paths.status_rows()),
+            hide_index=True,
+            width="stretch",
+            column_config={"Available": st.column_config.CheckboxColumn()},
+        )
+        if st.button("Clear cached metadata index", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+    st.sidebar.header("Patient and imaging filters")
+    working = patients.copy()
+
+    search = st.sidebar.text_input(
+        "Search dataset or patient", placeholder="e.g. RADCURE or subject ID"
+    ).strip()
+    if search:
+        pattern = search.lower()
+        working = working[
+            working["short_title"].astype(str).str.lower().str.contains(pattern, regex=False)
+            | working["subject_id"].astype(str).str.lower().str.contains(pattern, regex=False)
+            | working.get("title", "").astype(str).str.lower().str.contains(pattern, regex=False)
+        ]
+
+    datasets = st.sidebar.multiselect(
+        "TCIA dataset", options=option_values(working, "short_title")
+    )
+    if datasets:
+        working = working[working["short_title"].isin(datasets)]
+
+    access = st.sidebar.multiselect(
+        "Access level", options=option_values(working, "resolved_access_level")
+    )
+    if access:
+        working = working[working["resolved_access_level"].isin(access)]
+
+    image_sources = st.sidebar.multiselect(
+        "Available imaging",
+        options=[
+            "IDC DICOM",
+            "NIfTI",
+            "PathDB",
+            "Controlled-access file metadata",
+        ],
+    )
+    if image_sources:
+        source_columns = {
+            "IDC DICOM": "has_public_dicom",
+            "NIfTI": "has_nifti",
+            "PathDB": "has_pathdb",
+            "Controlled-access file metadata": "has_controlled_metadata",
+        }
+        mask = pd.Series(False, index=working.index)
+        for source in image_sources:
+            mask |= working[source_columns[source]].fillna(False)
+        working = working[mask]
+
+    modalities = st.sidebar.multiselect(
+        "Modality", options=token_options(working, "modalities")
+    )
+    working = apply_token_filter(working, "modalities", modalities)
+    body_parts = st.sidebar.multiselect(
+        "Body part examined", options=token_options(working, "body_parts")
+    )
+    working = apply_token_filter(working, "body_parts", body_parts)
+
+    with st.sidebar.expander("Clinical characteristics", expanded=True):
+        include_inferred = st.checkbox(
+            "Include dataset-scope inferred diagnosis/site",
+            value=True,
+            help=(
+                "When disabled, inferred diagnosis and site values are blanked "
+                "before filtering. Patients remain available through imaging."
+            ),
+        )
+        if not include_inferred:
+            if "primary_diagnosis_is_inferred" in working:
+                working.loc[
+                    working["primary_diagnosis_is_inferred"].fillna(0).astype(int) == 1,
+                    "primary_diagnosis",
+                ] = pd.NA
+            if "primary_site_is_inferred" in working:
+                working.loc[
+                    working["primary_site_is_inferred"].fillna(0).astype(int) == 1,
+                    "primary_site",
+                ] = pd.NA
+
+        clinical_filters = {
+            "Sex at birth": "sex_at_birth",
+            "Race": "race",
+            "Ethnicity": "ethnicity",
+            "Primary diagnosis": "primary_diagnosis",
+            "Primary site": "primary_site",
+            "Stage": "stage",
+            "Grade": "grade",
+            "Vital status": "vital_status",
+            "Response": "response",
+            "Screening result": "screening_result",
+        }
+        for label, column in clinical_filters.items():
+            selected = st.multiselect(label, options=option_values(working, column))
+            if selected:
+                working = working[working[column].isin(selected)]
+
+        ages = pd.to_numeric(working.get("age_at_baseline"), errors="coerce")
+        if ages.notna().any():
+            age_min = float(max(0, ages.min()))
+            age_max = float(ages.max())
+            if age_min < age_max:
+                selected_age = st.slider(
+                    "Age at baseline (years)",
+                    min_value=age_min,
+                    max_value=age_max,
+                    value=(age_min, age_max),
+                    step=0.5,
+                )
+                if selected_age != (age_min, age_max):
+                    working = working[
+                        pd.to_numeric(
+                            working["age_at_baseline"], errors="coerce"
+                        ).between(*selected_age)
+                    ]
             else:
-                st.info("No radiology or pathology imaging found for this patient.")
+                st.caption(f"Age at baseline: {age_min:g} years")
+
+        conflict_only = st.checkbox("Only patients with clinical conflicts")
+        if conflict_only and "conflict_count" in working:
+            working = working[
+                pd.to_numeric(working["conflict_count"], errors="coerce").fillna(0) > 0
+            ]
+
+    render_cart()
+
+    patient_count = len(working)
+    dataset_count = working["short_title"].nunique() if not working.empty else 0
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Matching patients", f"{patient_count:,}")
+    m2.metric("Datasets", f"{dataset_count:,}")
+    m3.metric(
+        "With public DICOM",
+        f"{int(working['has_public_dicom'].sum()) if not working.empty else 0:,}",
+    )
+    m4.metric(
+        "With clinical metadata",
+        f"{int(working['has_clinical'].sum()) if not working.empty else 0:,}",
+    )
+    m5.metric(
+        "Imaging linkage review",
+        f"{int((~working['has_any_imaging']).sum()) if not working.empty else 0:,}",
+        help=(
+            "Non-NLST patient records retained for audit because the current "
+            "artifacts do not yet link them to a patient-level imaging source."
+        ),
+    )
+
+    st.subheader("1. Select a patient")
+    if working.empty:
+        st.info("No patients match the current filters.")
+        return
+
+    page_size = st.selectbox("Rows per page", [25, 50, 100], index=0)
+    total_pages = max(1, (patient_count + page_size - 1) // page_size)
+    page = st.number_input("Page", min_value=1, max_value=total_pages, value=1)
+    start = (page - 1) * page_size
+    page_frame = working.iloc[start : start + page_size]
+    display_columns = [
+        "short_title",
+        "subject_id",
+        "resolved_access_level",
+        "sex_at_birth",
+        "age_at_baseline",
+        "primary_diagnosis",
+        "primary_site",
+        "stage",
+        "available_imaging",
+        "imaging_linkage_status",
+        "modalities",
+        "conflict_count",
+    ]
+    display_columns = [column for column in display_columns if column in page_frame]
+    event = st.dataframe(
+        page_frame[display_columns],
+        hide_index=True,
+        width="stretch",
+        on_select="rerun",
+        selection_mode="single-row",
+        key="patient_table",
+    )
+    if event.selection.rows:
+        selected_index = page_frame.index[event.selection.rows[0]]
+        st.session_state.selected_patient_key = working.loc[
+            selected_index, "patient_key"
+        ]
+
+    selected_key = st.session_state.get("selected_patient_key")
+    selected_rows = patients[patients["patient_key"] == selected_key]
+    if selected_rows.empty:
+        st.caption("Select a row to inspect clinical facts, time points, and scans.")
+        return
+
+    patient = selected_rows.iloc[0]
+    short_title = str(patient["short_title"])
+    subject_id = str(patient["subject_id"])
+    clinical_subject_id = str(
+        patient.get("clinical_subject_id")
+        if pd.notna(patient.get("clinical_subject_id"))
+        else subject_id
+    )
+    clinical_subject_ids = split_tokens(patient.get("clinical_subject_ids"))
+    if not clinical_subject_ids:
+        clinical_subject_ids = [clinical_subject_id]
+    idc_subject_id = str(
+        patient.get("idc_subject_id")
+        if pd.notna(patient.get("idc_subject_id"))
+        else subject_id
+    )
+    pathdb_subject_id = str(
+        patient.get("pathdb_subject_id")
+        if pd.notna(patient.get("pathdb_subject_id"))
+        else subject_id
+    )
+    nifti_subject_id = str(
+        patient.get("nifti_subject_id")
+        if pd.notna(patient.get("nifti_subject_id"))
+        else subject_id
+    )
+    controlled_subject_id = str(
+        patient.get("controlled_subject_id")
+        if pd.notna(patient.get("controlled_subject_id"))
+        else subject_id
+    )
+    access_level = str(patient.get("resolved_access_level", "unknown"))
+
+    st.divider()
+    st.subheader(f"2. Patient details · {short_title} / {subject_id}")
+    if pd.notna(patient.get("link")) and str(patient.get("link")).strip():
+        st.markdown(f"[Open the TCIA dataset page]({patient['link']})")
+    if access_level in {"controlled", "mixed"}:
+        st.markdown(
+            f'<div class="access-note">This dataset is <strong>{access_level}'
+            f'</strong>. Review the <a href="{POLICY_URL}">TCIA NIH Controlled '
+            "Data Access Policy</a>. Controlled files have no public viewer "
+            "route and are never downloaded by this app.</div>",
+            unsafe_allow_html=True,
+        )
+
+    summary_tab, facts_tab, scans_tab, package_tab = st.tabs(
+        ["Patient summary", "Clinical provenance", "Imaging time points & scans", "Pathology package"]
+    )
+    with summary_tab:
+        render_patient_summary(patient)
+
+    with facts_tab:
+        facts = load_patient_clinical_facts(
+            paths.clinical_db,
+            short_title,
+            clinical_subject_id,
+            subject_ids=clinical_subject_ids,
+        )
+        if facts.empty:
+            st.info("No patient-level clinical fact rows are available.")
         else:
-            if project_id in gc_metadata:
-                st.warning(f"Note: This patient belongs to project {project_id} which contains both open access and controlled access data.")
-                st.markdown(f"Follow the [TCIA Controlled Data Access Policy](https://www.cancerimagingarchive.net/nih-controlled-data-access-policy/) for full access.")
-
-            # Sort dates, keep 'Unknown' and 'Pathology' at the end
-            date_list = list(all_dates)
-            special = [d for d in date_list if d in ['Unknown', 'Pathology']]
-            regular = sorted([d for d in date_list if d not in ['Unknown', 'Pathology']], reverse=True)
-            sorted_dates = regular + sorted(special)
-
-            for date in sorted_dates:
-                with st.expander(f"Study Date: {date}"):
-                    # Radiology Series
-                    rad_series = p_idc[p_idc['StudyDate'] == date] if not p_idc.empty else pd.DataFrame()
-                    if not rad_series.empty:
-                        study_uids = rad_series['StudyInstanceUID'].unique()
-                        for suid in study_uids:
-                            study_series = rad_series[rad_series['StudyInstanceUID'] == suid]
-                            has_sm = (study_series['Modality'] == 'SM').any()
-
-                            if has_sm:
-                                st.write(f"**Pathology (IDC - Open Access)**")
-                                view_label = "View Study in SliM"
-                                study_url = f"https://viewer.imaging.datacommons.cancer.gov/slim/studies/{suid}"
-                            else:
-                                st.write(f"**Radiology (IDC - Open Access)**")
-                                view_label = "View Study in OHIF"
-                                study_url = f"https://viewer.imaging.datacommons.cancer.gov/v3/viewer/?StudyInstanceUIDs={suid}"
-
-                            st.markdown(f"**Study Instance UID**: {suid} ([{view_label}]({study_url}))")
-
-                            for _, s_row in study_series.iterrows():
-                                if s_row['Modality'] == 'SM':
-                                    view_url = f"https://viewer.imaging.datacommons.cancer.gov/slim/studies/{s_row['StudyInstanceUID']}/series/{s_row['SeriesInstanceUID']}"
-                                    view_label = "View in SliM"
-                                else:
-                                    view_url = f"https://viewer.imaging.datacommons.cancer.gov/v3/viewer/?StudyInstanceUIDs={s_row['StudyInstanceUID']}&SeriesInstanceUIDs={s_row['SeriesInstanceUID']}"
-                                    view_label = "View in OHIF"
-                                st.markdown(f"  - **{s_row['Modality']}**: {s_row['SeriesDescription']} ([{view_label}]({view_url}))")
-
-                    # Pathology Images (PathDB)
-                    path_imgs = p_path[p_path['created'].astype(str).str[:10] == date] if not p_path.empty else pd.DataFrame()
-                    if not path_imgs.empty:
-                        st.write("**Pathology (PathDB - Open Access)**")
-                        for _, p_row in path_imgs.iterrows():
-                            view_url = f"https://pathdb.cancerimagingarchive.net/caMicroscope/apps/mini/viewer.html?mode=pathdb&slideId={p_row['slideId']}"
-                            st.markdown(f"- **{p_row['imageId']}** ([View in caMicroscope]({view_url}))")
-
-        # --- General Commons (Controlled) ---
-        if not gc_files.empty:
-            p_gc = gc_files[gc_files['participant_id'] == patient_id]
-            if not p_gc.empty:
-                st.write("**Controlled Data (General Commons)**")
-                st.dataframe(p_gc[['file_name', 'file_type']], hide_index=True, width="stretch")
-                st.info("The files above require authorized access. See policy link above.")
-
-    with col_detail2:
-        st.write("**Patient Metadata Summary**")
-        p_meta = filtered_df[filtered_df['Case ID'] == patient_id].iloc[0]
-        st.json(p_meta.to_dict())
-
-# --- Exports ---
-
-st.divider()
-st.subheader("3. Export Cohort Bundle")
-
-if st.button("Prepare Download Bundle (ZIP)"):
-    with st.spinner("Generating bundle..."):
-        try:
-            zip_buffer = BytesIO()
-            with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-                # 1. Clinical Data
-                zip_file.writestr("clinical_data.csv", filtered_df.to_csv(index=False))
-
-                # 2. Radiology/Pathology Data (IDC Metadata)
-                patient_ids = filtered_df['Case ID'].unique()
-                rad_meta = idc_data[idc_data['PatientID'].isin(patient_ids)]
-                if not rad_meta.empty:
-                    zip_file.writestr("idc_imaging_metadata.csv", rad_meta.to_csv(index=False))
-
-                # 3. Pathology Data (PathDB Metadata)
-                path_manifest = generate_pathology_manifest(filtered_df, pathology_data)
-                if not path_manifest.empty:
-                    zip_file.writestr("pathdb_pathology_metadata.csv", path_manifest.to_csv(index=False))
-
-                # 4. Controlled Data (General Commons Metadata)
-                if not gc_files.empty:
-                    gc_meta = gc_files[gc_files['participant_id'].isin(patient_ids)]
-                    if not gc_meta.empty:
-                        zip_file.writestr("general_commons_metadata.csv", gc_meta.to_csv(index=False))
-
-                # 5. Visualization Plots
-                # Diagnoses Plot
-                diag_counts = filtered_df['Primary Diagnosis'].value_counts()
-                fig_diag = px.bar(diag_counts, title="Distribution of Diagnoses")
-                img_diag = fig_diag.to_image(format="png")
-                zip_file.writestr("visualizations/diagnoses_distribution.png", img_diag)
-
-                # Sites Plot
-                site_counts = filtered_df['Primary Site'].value_counts()
-                fig_site = px.pie(values=site_counts.values, names=site_counts.index, title="Distribution of Primary Sites")
-                img_site = fig_site.to_image(format="png")
-                zip_file.writestr("visualizations/sites_distribution.png", img_site)
-
-            st.download_button(
-                label="Download ZIP Bundle",
-                data=zip_buffer.getvalue(),
-                file_name="tcia_cohort_bundle.zip",
-                mime="application/zip"
+            st.dataframe(
+                facts,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "source_url": st.column_config.LinkColumn(
+                        "Source", display_text="Open source"
+                    )
+                },
+            )
+            st.caption(
+                "All sourced values are retained. Source priority resolves the "
+                "summary row; disagreements remain visible here."
             )
 
-            # Show controlled access warning if relevant
-            controlled_projects = [p for p in filtered_df['Project Short Name'].unique() if p in gc_metadata]
-            if controlled_projects:
-                st.warning(f"Note: This cohort contains controlled access data from General Commons for projects: {', '.join(controlled_projects)}. "
-                           "The ZIP bundle only contains metadata for open access data found in IDC and PathDB. "
-                           "Ensure you have authorized access from TCIA to use controlled datasets.")
+    with scans_tab:
+        idc_collection_id = (
+            str(patient.get("idc_collection_id"))
+            if pd.notna(patient.get("idc_collection_id"))
+            else None
+        )
+        idc_analysis_result_id = (
+            str(patient.get("idc_analysis_result_id"))
+            if pd.notna(patient.get("idc_analysis_result_id"))
+            and str(patient.get("idc_analysis_result_id")).strip()
+            else None
+        )
+        dicom = load_patient_idc(
+            paths,
+            catalog,
+            short_title,
+            idc_subject_id,
+            collection_id=idc_collection_id,
+            analysis_result_id=idc_analysis_result_id,
+        )
+        pathdb = load_patient_pathdb(
+            paths.snapshot_db, short_title, pathdb_subject_id
+        )
+        nifti = load_patient_nifti(paths.nifti_db, short_title, nifti_subject_id)
+        controlled = load_patient_controlled(
+            paths.controlled_db, short_title, controlled_subject_id
+        )
+        source_tabs = st.tabs(
+            [
+                f"IDC DICOM ({len(dicom):,})",
+                f"NIfTI ({len(nifti):,})",
+                f"PathDB ({len(pathdb):,})",
+                f"Controlled ({len(controlled):,})",
+            ]
+        )
+        with source_tabs[0]:
+            render_dicom(dicom, patient, access_level)
+        with source_tabs[1]:
+            render_nifti(nifti)
+        with source_tabs[2]:
+            render_pathdb(pathdb, patient, access_level)
+        with source_tabs[3]:
+            render_controlled(controlled, patient)
 
-        except Exception as e:
-            st.error(f"Error generating bundle: {e}")
+    with package_tab:
+        package = load_pathology_package_summary(paths.pathology_db, short_title)
+        if package.empty:
+            st.info("No public pathology Aspera package is scoped to this dataset.")
+        else:
+            st.dataframe(package, hide_index=True, width="stretch")
+            st.caption(
+                "Package counts are dataset-level. PathDB rows are used for "
+                "patient/slide drill-down; Aspera packages remain the original "
+                "submitter-provided copy and are not assumed byte-identical to "
+                "PathDB viewer files."
+            )
 
-# --- Visualizations ---
-st.divider()
-st.subheader("Data Insights")
-v_col1, v_col2 = st.columns(2)
 
-with v_col1:
-    diag_counts = filtered_df['Primary Diagnosis'].value_counts()
-    st.plotly_chart(px.bar(diag_counts, title="Distribution of Diagnoses"))
-
-with v_col2:
-    site_counts = filtered_df['Primary Site'].value_counts()
-    st.plotly_chart(px.pie(values=site_counts.values, names=site_counts.index, title="Distribution of Primary Sites"))
+if __name__ == "__main__":
+    main()

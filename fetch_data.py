@@ -4,6 +4,10 @@ from idc_index import IDCClient
 import os
 import json
 import urllib.request
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 def fetch_wp_metadata():
     print("Fetching WordPress metadata...")
@@ -77,34 +81,118 @@ def fetch_wp_metadata():
 
 def fetch_idc_metadata():
     print("Fetching IDC metadata...")
-    # Load clinical data to get projects
-    df_clin = pd.read_excel("https://github.com/kirbyju/tcia-cohort-builder/raw/refs/heads/main/crdc-clinical.xlsx")
-    projects = df_clin['Project Short Name'].unique()
-    idc_collections = [p.lower().replace('-', '_') for p in projects]
-
     client = IDCClient()
-    query = f"""
-    SELECT
-        collection_id,
-        PatientID,
-        StudyInstanceUID,
-        StudyDate,
-        StudyDescription,
-        BodyPartExamined,
-        SeriesInstanceUID,
-        Modality,
-        SeriesDescription,
-        instanceCount,
-        series_size_MB
-    FROM index
-    WHERE collection_id IN ({','.join([repr(c) for c in idc_collections])})
-    """
-    df = client.sql_query(query)
-    if df is not None and not df.empty:
-        df.to_parquet('idc_metadata.parquet')
-        print(f"Saved {len(df)} IDC records.")
-    else:
-        print("No IDC records found.")
+    print(f"Using idc-index {client.get_idc_version()}.")
+
+    # The old exporter selected IDC collections from crdc-clinical.xlsx. That
+    # silently excluded public imaging-only collections such as 4D-Lung and
+    # C4KC-KiTS. Export the complete current IDC series index instead. The v2
+    # app applies the visible TCIA WordPress snapshot as its provenance/access
+    # allowlist when loading this cache.
+    columns = [
+        "collection_id",
+        "analysis_result_id",
+        "PatientID",
+        "PatientAge",
+        "PatientSex",
+        "StudyInstanceUID",
+        "StudyDate",
+        "StudyDescription",
+        "BodyPartExamined",
+        "SeriesInstanceUID",
+        "SeriesDate",
+        "Modality",
+        "SeriesDescription",
+        "instanceCount",
+        "series_size_MB",
+        "license_short_name",
+        "source_DOI",
+    ]
+    string_columns = [column for column in columns if column not in {
+        "instanceCount", "series_size_MB"
+    }]
+
+    collection_rows = client.sql_query(
+        "SELECT DISTINCT collection_id FROM index "
+        "WHERE COALESCE(collection_id, '') <> '' ORDER BY collection_id"
+    )
+    collection_ids = collection_rows["collection_id"].astype(str).tolist()
+    if not collection_ids:
+        raise RuntimeError("The current IDC index returned no collections.")
+
+    stats = client.sql_query(
+        """
+        SELECT COUNT(DISTINCT collection_id) AS collections,
+               COUNT(DISTINCT PatientID) AS patients,
+               COUNT(*) AS series,
+               SUM(instanceCount) AS instances,
+               SUM(series_size_MB) / 1000000 AS size_TB
+        FROM index
+        """
+    ).iloc[0]
+    print(
+        "IDC scope: "
+        f"{int(stats['collections']):,} collections, "
+        f"{int(stats['patients']):,} patients, "
+        f"{int(stats['series']):,} series, "
+        f"{float(stats['size_TB']):,.3f} TB."
+    )
+
+    output_path = Path("idc_metadata.parquet")
+    temporary_path = Path("idc_metadata.parquet.tmp")
+    batch_size = 20
+    writer = None
+    total_rows = 0
+    try:
+        for start in range(0, len(collection_ids), batch_size):
+            batch = collection_ids[start:start + batch_size]
+            literals = ",".join(
+                "'" + value.replace("'", "''") + "'" for value in batch
+            )
+            query = (
+                f"SELECT {', '.join(columns)} FROM index "
+                f"WHERE collection_id IN ({literals})"
+            )
+            frame = client.sql_query(query)
+            if frame is None or frame.empty:
+                continue
+            for column in string_columns:
+                frame[column] = frame[column].astype("string")
+            frame["instanceCount"] = pd.to_numeric(
+                frame["instanceCount"], errors="coerce"
+            ).astype("Int64")
+            frame["series_size_MB"] = pd.to_numeric(
+                frame["series_size_MB"], errors="coerce"
+            ).astype("float64")
+            table = pa.Table.from_pandas(frame[columns], preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    temporary_path,
+                    table.schema,
+                    compression="zstd",
+                    use_dictionary=True,
+                )
+            writer.write_table(table)
+            total_rows += len(frame)
+            print(
+                f"Exported {total_rows:,} series "
+                f"({min(start + batch_size, len(collection_ids))}/"
+                f"{len(collection_ids)} collections)."
+            )
+        if writer is None:
+            raise RuntimeError("The current IDC index returned no series rows.")
+        writer.close()
+        writer = None
+        os.replace(temporary_path, output_path)
+        print(
+            f"Saved {total_rows:,} IDC records to {output_path} "
+            f"({output_path.stat().st_size / 1_000_000:.1f} MB)."
+        )
+    finally:
+        if writer is not None:
+            writer.close()
+        if temporary_path.exists():
+            temporary_path.unlink()
 
 def fetch_gc_metadata():
     print("Fetching General Commons metadata...")
