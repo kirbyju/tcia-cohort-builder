@@ -17,17 +17,17 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
+      - name: Install application dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests idc-index pyarrow openpyxl
+          pip install -r requirements.txt
 
-      - name: Fetch data
+      - name: Refresh IDC series metadata
         run: python fetch_data.py
 
       - name: Commit and push changes
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add wp_metadata.parquet idc_metadata.parquet gc_metadata.parquet
+          git add idc_metadata.parquet
           git diff --quiet && git diff --staged --quiet || (git commit -m "Daily metadata update" && git push)

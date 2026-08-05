@@ -6,14 +6,17 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from cohort_builder_v2_data import (
+from cohort_builder_data import (
     DataPaths,
     aggregate_idc,
+    build_filtered_cohort_download,
+    build_grouped_patient_index,
     build_manifest_download,
     canonical_imaging_token,
     canonicalize_patient_categories,
     cart_item,
     collapse_clinical_subject_aliases,
+    collect_filtered_imaging_routes,
     deduplicate_cart,
     exclude_nlst_clinical_only,
     idc_viewer_url,
@@ -28,7 +31,7 @@ from cohort_builder_v2_data import (
 import pandas as pd
 
 
-class CohortBuilderV2DataTests(unittest.TestCase):
+class CohortBuilderDataTests(unittest.TestCase):
     def test_dataset_keys_match_idc_style_names(self):
         self.assertEqual(
             normalize_dataset_key("NSCLC-Radiomics"), normalize_dataset_key("nsclc_radiomics")
@@ -199,6 +202,99 @@ class CohortBuilderV2DataTests(unittest.TestCase):
                 analysis_result_id="Derived-Result",
             )
             self.assertEqual(set(detail["SeriesInstanceUID"]), {"DERIVED"})
+
+            source_detail = load_patient_idc(
+                paths,
+                catalog,
+                "Source-Collection",
+                "P1",
+                collection_id="source_collection",
+                direct_collection_only=True,
+            )
+            self.assertEqual(set(source_detail["SeriesInstanceUID"]), {"ORIGINAL"})
+
+            route_patient = pd.DataFrame(
+                [
+                    {
+                        "short_title": "Source-Collection",
+                        "dataset_type": "Collection",
+                        "subject_id": "P1",
+                        "idc_subject_id": "P1",
+                        "idc_collection_id": "source_collection",
+                        "idc_analysis_result_id": "",
+                    }
+                ]
+            )
+            routes, _ = collect_filtered_imaging_routes(
+                paths,
+                catalog,
+                route_patient,
+                imaging_sources=["IDC DICOM"],
+                direct_collection_titles=["Source-Collection"],
+            )
+            self.assertEqual(routes["SeriesInstanceUID"], ["ORIGINAL"])
+
+    def test_verified_collection_and_analysis_memberships_group_for_display(self):
+        patients = pd.DataFrame(
+            [
+                {
+                    "patient_key": "Source-Collection|P1",
+                    "short_title": "Source-Collection",
+                    "dataset_type": "Collection",
+                    "subject_id": "P1",
+                    "idc_subject_id": "P1",
+                    "idc_collection_id": "source_collection",
+                    "idc_analysis_result_id": "",
+                    "has_clinical": True,
+                    "primary_diagnosis": "Diagnosis",
+                    "dicom_series": 2,
+                    "modalities": "CT; SEG",
+                    "resolved_access_level": "open",
+                },
+                {
+                    "patient_key": "Derived-Result|P1",
+                    "short_title": "Derived-Result",
+                    "dataset_type": "Analysis Result",
+                    "subject_id": "P1",
+                    "idc_subject_id": "P1",
+                    "idc_collection_id": "source_collection",
+                    "idc_analysis_result_id": "derived_result",
+                    "has_clinical": False,
+                    "primary_diagnosis": None,
+                    "dicom_series": 1,
+                    "modalities": "SEG",
+                    "resolved_access_level": "open",
+                },
+                {
+                    "patient_key": "Unrelated|P1",
+                    "short_title": "Unrelated",
+                    "dataset_type": "Collection",
+                    "subject_id": "P1",
+                    "idc_subject_id": "P1",
+                    "idc_collection_id": "unrelated",
+                    "idc_analysis_result_id": "",
+                    "has_clinical": False,
+                    "primary_diagnosis": None,
+                    "dicom_series": 4,
+                    "modalities": "MR",
+                    "resolved_access_level": "open",
+                },
+            ]
+        )
+
+        grouped, memberships = build_grouped_patient_index(patients)
+
+        self.assertEqual(len(grouped), 2)
+        self.assertEqual(len(memberships), 3)
+        combined = grouped[grouped["dataset_count"] == 2].iloc[0]
+        self.assertEqual(combined["primary_diagnosis"], "Diagnosis")
+        self.assertEqual(int(combined["dicom_series"]), 2)
+        self.assertIn("Source-Collection [Collection]", combined["dataset_memberships"])
+        self.assertIn("Derived-Result [Analysis Result]", combined["dataset_memberships"])
+        grouped_members = memberships[
+            memberships["patient_group_key"] == combined["patient_group_key"]
+        ]
+        self.assertEqual(set(grouped_members["short_title"]), {"Source-Collection", "Derived-Result"})
 
     def test_clinical_loader_uses_complete_subject_view(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -373,6 +469,71 @@ class CohortBuilderV2DataTests(unittest.TestCase):
                 header = archive.read(name).decode("utf-8").splitlines()[0]
                 self.assertNotIn(",", header)
         self.assertEqual(sum(counts.values()), 3)
+
+    def test_filtered_cohort_download_includes_patients_and_separate_routes(self):
+        patients = pd.DataFrame(
+            [
+                {
+                    "short_title": "TEST",
+                    "dataset_type": "Collection",
+                    "subject_id": "P1",
+                    "primary_diagnosis": "Example diagnosis",
+                    "primary_site": "Example site",
+                },
+                {
+                    "short_title": "TEST",
+                    "dataset_type": "Collection",
+                    "subject_id": "P2",
+                    "primary_diagnosis": "Example diagnosis",
+                    "primary_site": "Example site",
+                },
+            ]
+        )
+        routes = {
+            "SeriesInstanceUID": ["1.2.3", "1.2.3", "1.2.4"],
+            "imageUrl": ["https://example.org/slide.svs"],
+        }
+        unrouted = pd.DataFrame(
+            [
+                {
+                    "source": "NIfTI",
+                    "short_title": "TEST",
+                    "subject_id": "P2",
+                    "item": "scan.nii.gz",
+                    "reason": "No supported route.",
+                }
+            ]
+        )
+
+        payload, filename, mime, counts = build_filtered_cohort_download(
+            patients, routes, unrouted
+        )
+
+        self.assertEqual(filename, "tcia_filtered_cohort_export.zip")
+        self.assertEqual(mime, "application/zip")
+        self.assertEqual(counts["patients"], 2)
+        self.assertEqual(counts["SeriesInstanceUID"], 2)
+        self.assertEqual(counts["imageUrl"], 1)
+        self.assertEqual(counts["unrouted_imaging"], 1)
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            self.assertEqual(
+                set(archive.namelist()),
+                {
+                    "README.txt",
+                    "tcia_filtered_patients.csv",
+                    "tcia_dicom_series.csv",
+                    "tcia_pathdb_files.csv",
+                    "tcia_unrouted_imaging_inventory.csv",
+                },
+            )
+            patients_csv = archive.read("tcia_filtered_patients.csv").decode("utf-8")
+            self.assertIn("primary_diagnosis", patients_csv.splitlines()[0])
+            self.assertEqual(len(patients_csv.splitlines()), 3)
+            dicom_csv = archive.read("tcia_dicom_series.csv").decode("utf-8")
+            self.assertEqual(
+                dicom_csv.splitlines(),
+                ["SeriesInstanceUID", "1.2.3", "1.2.4"],
+            )
 
 
 if __name__ == "__main__":

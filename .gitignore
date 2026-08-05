@@ -159,9 +159,4 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 .DS_Store
-~$clinical-data.xlsx
-gdc.xlsx
-nci_program_clinical.xlsx
-tcia-cohort-builder2.py
-nci_program_clinical.xlsx
-/venv-cohort-builder
+*.parquet.tmp

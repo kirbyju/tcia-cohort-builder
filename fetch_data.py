@@ -1,122 +1,51 @@
-import pandas as pd
-import requests
-from idc_index import IDCClient
+"""Refresh the public IDC series index used by the Participant Explorer."""
+
+from __future__ import annotations
+
+import argparse
 import os
-import json
-import urllib.request
 from pathlib import Path
 
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from idc_index import IDCClient
 
-def fetch_wp_metadata():
-    print("Fetching WordPress metadata...")
-    def fetch_v2(endpoint):
-        base_url = f"https://cancerimagingarchive.net/api/v2/{endpoint}?per_page=100&v=1"
-        all_results = []
-        try:
-            r = requests.get(base_url, timeout=60)
-            r.raise_for_status()
-            data = r.json()
-            all_results.extend(data.get('results', []))
-            total_pages = int(data.get('total_pages', 1))
-            if total_pages > 1:
-                for p in range(2, total_pages + 1):
-                    print(f"Fetching {endpoint} page {p} of {total_pages}...")
-                    r = requests.get(f"{base_url}&page={p}", timeout=60)
-                    r.raise_for_status()
-                    all_results.extend(r.json().get('results', []))
-        except Exception as e:
-            print(f"Error fetching {endpoint}: {e}")
-        return all_results
 
-    c_v2 = fetch_v2('collections')
-    a_v2 = fetch_v2('analysis-results')
+IDC_COLUMNS = [
+    "collection_id",
+    "analysis_result_id",
+    "PatientID",
+    "PatientAge",
+    "PatientSex",
+    "StudyInstanceUID",
+    "StudyDate",
+    "StudyDescription",
+    "BodyPartExamined",
+    "SeriesInstanceUID",
+    "SeriesDate",
+    "Modality",
+    "SeriesDescription",
+    "instanceCount",
+    "series_size_MB",
+    "license_short_name",
+    "source_DOI",
+]
+STRING_COLUMNS = [
+    column for column in IDC_COLUMNS if column not in {"instanceCount", "series_size_MB"}
+]
 
-    wp_data = []
 
-    def process_v2(results, is_collection=True):
-        short_title_key = 'collection_short_title' if is_collection else 'result_short_title'
-        doi_key = 'collection_doi' if is_collection else 'result_doi'
-        downloads_key = 'collection_downloads' if is_collection else 'result_downloads'
-
-        for item in results:
-            short_title = str(item.get(short_title_key, ""))
-            if not short_title or short_title == "nan":
-                continue
-
-            downloads = item.get(downloads_key, [])
-            is_controlled = False
-            licenses = []
-            if isinstance(downloads, list):
-                for d in downloads:
-                    if isinstance(d, dict):
-                        l_info = d.get('license', {})
-                        l_label = str(l_info.get('label', '') if isinstance(l_info, dict) else l_info).lower()
-                        licenses.append(l_label)
-                        if any(term in l_label for term in ['controlled', 'restricted', 'limited', 'usage agreement', 'dbgap']):
-                            is_controlled = True
-
-            if not licenses:
-                access = str(item.get('collection_page_accessibility', '')).lower()
-                if any(term in access for term in ['controlled', 'restricted', 'limited']):
-                    is_controlled = True
-
-            wp_data.append({
-                'short_title': short_title,
-                'is_controlled': is_controlled,
-                'link': item.get('url', ''),
-                'doi': item.get(doi_key, ''),
-                'species': str(item.get('species', '')),
-                'cancer_types': str(item.get('cancer_types', '')),
-                'licenses': "; ".join(licenses)
-            })
-
-    process_v2(c_v2, True)
-    process_v2(a_v2, False)
-
-    df = pd.DataFrame(wp_data)
-    df.to_parquet('wp_metadata.parquet')
-    print(f"Saved {len(df)} WP records.")
-
-def fetch_idc_metadata():
-    print("Fetching IDC metadata...")
-    client = IDCClient()
+def refresh_idc_metadata(output_path: Path, batch_size: int = 20) -> None:
+    """Atomically export the complete current IDC series index to Parquet."""
+    client = IDCClient.client()
     print(f"Using idc-index {client.get_idc_version()}.")
 
-    # The old exporter selected IDC collections from crdc-clinical.xlsx. That
-    # silently excluded public imaging-only collections such as 4D-Lung and
-    # C4KC-KiTS. Export the complete current IDC series index instead. The v2
-    # app applies the visible TCIA WordPress snapshot as its provenance/access
-    # allowlist when loading this cache.
-    columns = [
-        "collection_id",
-        "analysis_result_id",
-        "PatientID",
-        "PatientAge",
-        "PatientSex",
-        "StudyInstanceUID",
-        "StudyDate",
-        "StudyDescription",
-        "BodyPartExamined",
-        "SeriesInstanceUID",
-        "SeriesDate",
-        "Modality",
-        "SeriesDescription",
-        "instanceCount",
-        "series_size_MB",
-        "license_short_name",
-        "source_DOI",
-    ]
-    string_columns = [column for column in columns if column not in {
-        "instanceCount", "series_size_MB"
-    }]
-
-    collection_rows = client.sql_query(
+    collections = client.sql_query(
         "SELECT DISTINCT collection_id FROM index "
         "WHERE COALESCE(collection_id, '') <> '' ORDER BY collection_id"
     )
-    collection_ids = collection_rows["collection_id"].astype(str).tolist()
+    collection_ids = collections["collection_id"].astype(str).tolist()
     if not collection_ids:
         raise RuntimeError("The current IDC index returned no collections.")
 
@@ -138,25 +67,24 @@ def fetch_idc_metadata():
         f"{float(stats['size_TB']):,.3f} TB."
     )
 
-    output_path = Path("idc_metadata.parquet")
-    temporary_path = Path("idc_metadata.parquet.tmp")
-    batch_size = 20
-    writer = None
+    output_path = output_path.expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    writer: pq.ParquetWriter | None = None
     total_rows = 0
     try:
         for start in range(0, len(collection_ids), batch_size):
-            batch = collection_ids[start:start + batch_size]
+            batch = collection_ids[start : start + batch_size]
             literals = ",".join(
                 "'" + value.replace("'", "''") + "'" for value in batch
             )
-            query = (
-                f"SELECT {', '.join(columns)} FROM index "
+            frame = client.sql_query(
+                f"SELECT {', '.join(IDC_COLUMNS)} FROM index "
                 f"WHERE collection_id IN ({literals})"
             )
-            frame = client.sql_query(query)
             if frame is None or frame.empty:
                 continue
-            for column in string_columns:
+            for column in STRING_COLUMNS:
                 frame[column] = frame[column].astype("string")
             frame["instanceCount"] = pd.to_numeric(
                 frame["instanceCount"], errors="coerce"
@@ -164,7 +92,8 @@ def fetch_idc_metadata():
             frame["series_size_MB"] = pd.to_numeric(
                 frame["series_size_MB"], errors="coerce"
             ).astype("float64")
-            table = pa.Table.from_pandas(frame[columns], preserve_index=False)
+
+            table = pa.Table.from_pandas(frame[IDC_COLUMNS], preserve_index=False)
             if writer is None:
                 writer = pq.ParquetWriter(
                     temporary_path,
@@ -179,6 +108,7 @@ def fetch_idc_metadata():
                 f"({min(start + batch_size, len(collection_ids))}/"
                 f"{len(collection_ids)} collections)."
             )
+
         if writer is None:
             raise RuntimeError("The current IDC index returned no series rows.")
         writer.close()
@@ -191,94 +121,23 @@ def fetch_idc_metadata():
     finally:
         if writer is not None:
             writer.close()
-        if temporary_path.exists():
-            temporary_path.unlink()
+        temporary_path.unlink(missing_ok=True)
 
-def fetch_gc_metadata():
-    print("Fetching General Commons metadata...")
-    endpoint = "https://general.datacommons.cancer.gov/v1/graphql/"
 
-    # 1. Fetch study acronyms
-    query_studies = """
-    query TCIAStudies($phs: [String], $first: Int) {
-      studies(phs_accessions: $phs, first: $first) {
-        study_acronym
-      }
-    }
-    """
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path(__file__).resolve().parent / "idc_metadata.parquet",
+        help="Destination Parquet path (default: repository idc_metadata.parquet)",
+    )
+    parser.add_argument("--batch-size", type=int, default=20)
+    args = parser.parse_args()
+    if args.batch_size < 1:
+        parser.error("--batch-size must be at least 1")
+    refresh_idc_metadata(args.output, args.batch_size)
 
-    def post_query(query, variables=None):
-        payload = json.dumps({"query": query, "variables": variables}).encode("utf-8")
-        request = urllib.request.Request(
-            endpoint,
-            data=payload,
-            headers={"Content-Type": "application/json", "User-Agent": "tcia-query-skill/1.0"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=60) as response:
-            return json.loads(response.read().decode("utf-8"))
-
-    try:
-        res_studies = post_query(query_studies, {"phs": ["phs004225"], "first": 1000})
-        studies = res_studies.get("data", {}).get("studies", [])
-        df_studies = pd.DataFrame(studies)
-        if not df_studies.empty:
-            df_studies.to_parquet('gc_metadata.parquet')
-            print(f"Saved {len(df_studies)} GC study acronyms.")
-    except Exception as e:
-        print(f"Error fetching GC studies: {e}")
-
-    # 2. Fetch file metadata for phs004225
-    print("Fetching GC file metadata (this may take a while)...")
-    all_files = []
-    first = 10000
-    offset = 0
-    query_files = """
-    query GCFiles($phs: String!, $first: Int, $offset: Int) {
-      files(phs_accession: $phs, first: $first, offset: $offset) {
-        file_name
-        file_type
-        participant_ids
-      }
-    }
-    """
-
-    try:
-        while True:
-            print(f"Requesting files with offset {offset}...")
-            res_files = post_query(query_files, {"phs": "phs004225", "first": first, "offset": offset})
-            if 'errors' in res_files:
-                print(f"Error in response: {res_files['errors']}")
-                break
-            files = res_files.get("data", {}).get("files", [])
-            if not files:
-                print("No more files found.")
-                break
-            all_files.extend(files)
-            print(f"Fetched {len(all_files)} total files...")
-            if len(files) < first:
-                print("Last page reached.")
-                break
-            offset += first
-
-        if all_files:
-            # Flatten participant_ids for easier searching later
-            flattened = []
-            for f in all_files:
-                p_ids = f.get('participant_ids', [])
-                if not p_ids:
-                    flattened.append({'file_name': f['file_name'], 'file_type': f['file_type'], 'participant_id': None})
-                else:
-                    for pid in p_ids:
-                        flattened.append({'file_name': f['file_name'], 'file_type': f['file_type'], 'participant_id': pid})
-
-            df_files = pd.DataFrame(flattened)
-            df_files.to_parquet('gc_files.parquet')
-            print(f"Saved {len(df_files)} GC file records.")
-    except Exception as e:
-        print(f"Error fetching GC files: {e}")
 
 if __name__ == "__main__":
-    fetch_wp_metadata()
-    fetch_idc_metadata()
-    fetch_gc_metadata()
+    main()

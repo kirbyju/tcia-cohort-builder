@@ -1,10 +1,4 @@
-streamlit==1.57.0
-pandas==2.2.3
-plotly==6.7.0
-requests==2.33.1
-xlsxwriter==3.2.9
-tcia_utils==3.3.1
-idc-index==0.12.3
-openpyxl==3.1.5
+streamlit==1.59.2
+pandas==2.3.3
 pyarrow==24.0.0
-kaleido==1.2.0
+idc-index==0.12.5

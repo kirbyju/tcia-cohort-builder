@@ -1,26 +1,38 @@
-# TCIA Cohort Builder
+# TCIA Participant Explorer
 
-The patient-centric application is now the primary entry point at
-`tcia-cohort-builder.py`. The identical `tcia-cohort-builder-v2.py` file is
-retained temporarily as a compatibility/reference entry point.
+The TCIA Participant Explorer is a patient-level Streamlit interface for
+finding TCIA data, reviewing source-aware clinical metadata, inspecting imaging
+and supporting files, and preparing retrieval manifests.
 
-## Patient-centric cohort builder
+## Capabilities
 
-`tcia-cohort-builder.py` provides one-row-per-patient filtering and drill-down
-across:
+- one row per dataset-scoped patient;
+- verified Collection and Analysis Result memberships grouped without losing
+  their separate provenance;
+- basic and advanced cohort filters with a source-aware patient detail panel;
+- public IDC DICOM, NIfTI, PathDB, and controlled-metadata inventory;
+- viewer routes for publicly viewable imaging; and
+- filtered cohort downloads containing patient-level clinical data plus
+  route-specific TCIA Data Retriever manifests.
 
-- the TCIA WordPress/Collection Manager provenance and access snapshot;
-- patient-level clinical metadata with source priority, inference flags, and
-  conflict preservation;
-- public DICOM series exported from IDC/idc-index;
-- IDC-derived series represented under their TCIA Analysis Result as well as
-  their source Collection;
-- public NIfTI file metadata;
-- PathDB slide metadata and pathology Aspera package summaries; and
-- public metadata for controlled-access files.
+## Requirements
 
-The default setup expects `tcia-query-skill` to be a sibling of this
-repository. Prepare its metadata caches before starting the app:
+- Python 3.10 or newer;
+- the packages pinned in `requirements.txt`;
+- the current `idc_metadata.parquet` series index in this repository; and
+- TCIA metadata SQLite caches produced by the sibling `tcia-query-skill`
+  checkout.
+
+Create an environment and install the application dependencies:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Prepare the TCIA metadata caches:
 
 ```bash
 cd ../tcia-query-skill
@@ -29,32 +41,47 @@ python scripts/tcia_clinical_metadata.py ensure
 python scripts/tcia_nifti_metadata.py ensure
 python scripts/tcia_pathology_metadata.py ensure
 python scripts/tcia_controlled_access_metadata.py ensure
+```
 
+Then start the canonical application:
+
+```bash
 cd ../tcia-cohort-builder
 streamlit run tcia-cohort-builder.py
 ```
 
-Set `TCIA_QUERY_SKILL_ROOT` when the skill checkout lives elsewhere. Individual
-paths can be overridden with `TCIA_SNAPSHOT_DB`,
+Set `TCIA_QUERY_SKILL_ROOT` if the skill checkout lives elsewhere. Individual
+inputs can be overridden with `TCIA_SNAPSHOT_DB`,
 `TCIA_CLINICAL_METADATA_DB`, `TCIA_NIFTI_METADATA_DB`,
 `TCIA_PATHOLOGY_METADATA_DB`, `TCIA_CONTROLLED_ACCESS_METADATA_DB`, and
 `TCIA_IDC_METADATA_PARQUET`.
 
-The v2 shopping cart creates TCIA Data Retriever-compatible CSV files with one
-route column per manifest: `SeriesInstanceUID` for public DICOM, `imageUrl` for
-public PathDB files, or `drs_uri` for controlled files. A mixed cart downloads
-as a ZIP containing separate CSV manifests.
+## Data refresh
 
-The patient count is intentionally not the raw row count of
-`clinical_subjects`. V2 collapses verified dataset-specific identifier aliases
-to one patient (including scan-level CBIS-DDSM IDs), and excludes only NLST
-clinical-only subjects because those records extend beyond TCIA's published
-imaging cohort. Non-NLST records that still lack a patient-level imaging link
-remain visible with `Needs artifact linkage review` so artifact extraction and
-crosswalk gaps are auditable.
+`idc_metadata.parquet` is the only application data artifact retained in this
+repository. It contains the public IDC series fields needed by the patient
+index, imaging drill-down, viewer routing, and manifest export. Refresh it with:
 
-`fetch_data.py` exports the complete current IDC series index into
-`idc_metadata.parquet`. The v2 application then intersects that cache with the
-visible TCIA snapshot. This is intentional: filtering the IDC export through
-the legacy clinical workbook omits imaging-only collections such as 4D-Lung
-and C4KC-KiTS.
+```bash
+python fetch_data.py
+```
+
+The refresh writes to a temporary Parquet file and replaces the current index
+only after the complete IDC export succeeds. The daily GitHub Actions workflow
+uses the same command.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The patient count is intentionally not the raw clinical row count. Verified
+dataset-specific aliases are collapsed; related Collection and Analysis Result
+memberships are grouped only when IDC supplies the same collection identity and
+exact PatientID. Unrelated datasets that reuse a PatientID remain separate.
+
+## Branding
+
+The interface uses TCIA's published logo and color palette as documented at
+[cancerimagingarchive.net/branding](https://www.cancerimagingarchive.net/branding/).

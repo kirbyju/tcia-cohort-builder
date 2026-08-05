@@ -1,4 +1,4 @@
-"""Patient-centric data access for the TCIA Cohort Builder v2.
+"""Patient-centric data access for the TCIA Participant Explorer.
 
 The module intentionally keeps Streamlit concerns out of the data layer so the
 patient index, drill-down queries, and Data Retriever manifests can be tested
@@ -40,6 +40,49 @@ CLINICAL_CATEGORICAL_COLUMNS = (
     "progression",
     "response",
     "screening_result",
+)
+COHORT_EXPORT_COLUMNS = (
+    "short_title",
+    "dataset_memberships",
+    "dataset_count",
+    "dataset_type",
+    "title",
+    "subject_id",
+    "resolved_access_level",
+    "sex_at_birth",
+    "race",
+    "ethnicity",
+    "age_at_baseline",
+    "age_at_diagnosis",
+    "age_at_enrollment_years",
+    "age_at_imaging_years",
+    "primary_diagnosis",
+    "primary_site",
+    "stage",
+    "grade",
+    "vital_status",
+    "days_to_death",
+    "days_to_last_followup",
+    "overall_survival_days",
+    "progression_free_survival_days",
+    "recurrence",
+    "progression",
+    "response",
+    "screening_result",
+    "primary_diagnosis_is_inferred",
+    "primary_site_is_inferred",
+    "source_kinds",
+    "source_count",
+    "conflict_count",
+    "has_clinical",
+    "available_imaging",
+    "modalities",
+    "body_parts",
+    "dicom_series",
+    "nifti_files",
+    "pathdb_slides",
+    "controlled_files",
+    "imaging_linkage_status",
 )
 CANONICAL_CATEGORY_VALUES = {
     "sex_at_birth": {
@@ -528,11 +571,14 @@ def load_clinical_subjects(path: Path) -> pd.DataFrame:
 
 
 def load_idc_series(
-    parquet_path: Path, catalog: pd.DataFrame | None = None
+    parquet_path: Path,
+    catalog: pd.DataFrame | None = None,
+    columns: Sequence[str] | None = None,
+    filters: object | None = None,
 ) -> pd.DataFrame:
     if not parquet_path.exists():
         return pd.DataFrame()
-    frame = pd.read_parquet(parquet_path)
+    frame = pd.read_parquet(parquet_path, columns=columns, filters=filters)
     if frame.empty:
         return frame
     key_map = dataset_key_map(catalog) if catalog is not None else {}
@@ -937,6 +983,175 @@ def build_patient_index(paths: DataPaths) -> pd.DataFrame:
     return patients
 
 
+def build_grouped_patient_index(
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Group verified Collection/Analysis Result memberships for presentation.
+
+    The returned membership frame preserves every dataset-scoped source row.
+    Grouping is allowed only when IDC supplies the same collection identifier
+    and normalized PatientID for at least one Collection and Analysis Result.
+    """
+    if frame.empty:
+        empty = frame.copy()
+        empty["patient_group_key"] = pd.Series(dtype=str)
+        return empty, empty
+
+    members = frame.copy()
+    members["patient_group_key"] = members["patient_key"].astype(str)
+    collection_ids = members.get(
+        "idc_collection_id", pd.Series(index=members.index, dtype=str)
+    ).fillna("").astype(str).str.strip().str.casefold()
+    idc_subjects = members.get(
+        "idc_subject_id", pd.Series(index=members.index, dtype=str)
+    ).fillna("").astype(str).str.strip().str.casefold()
+    candidates = "idc|" + collection_ids + "|" + idc_subjects
+    eligible = (collection_ids != "") & (idc_subjects != "")
+
+    candidate_rows = members.loc[eligible, ["dataset_type"]].copy()
+    candidate_rows["candidate_key"] = candidates.loc[eligible]
+    type_sets = candidate_rows.groupby("candidate_key")["dataset_type"].agg(
+        lambda values: frozenset(str(value) for value in values)
+    )
+    verified_keys = set(
+        type_sets[
+            type_sets.map(
+                lambda values: {"Collection", "Analysis Result"}.issubset(values)
+            )
+        ].index
+    )
+    verified = eligible & candidates.isin(verified_keys)
+    members.loc[verified, "patient_group_key"] = candidates.loc[verified]
+
+    type_rank = members.get("dataset_type", "").map(
+        lambda value: 0 if value == "Collection" else 1
+    )
+    clinical_rank = ~members.get(
+        "has_clinical", pd.Series(False, index=members.index)
+    ).fillna(False).astype(bool)
+    ordered = (
+        members.assign(_type_rank=type_rank, _clinical_rank=clinical_rank)
+        .sort_values(
+            ["patient_group_key", "_clinical_rank", "_type_rank", "short_title"],
+            kind="stable",
+        )
+        .drop(columns=["_type_rank", "_clinical_rank"])
+    )
+
+    def decorate(group: pd.DataFrame) -> dict[str, object]:
+        combined = group.iloc[0].to_dict()
+        memberships = [
+            f"{row.short_title} [{row.dataset_type}]"
+            for row in group[["short_title", "dataset_type"]]
+            .drop_duplicates()
+            .itertuples(index=False)
+        ]
+        member_titles = list(dict.fromkeys(group["short_title"].astype(str)))
+        member_keys = list(dict.fromkeys(group["patient_key"].astype(str)))
+        combined["patient_group_key"] = str(group.iloc[0]["patient_group_key"])
+        combined["patient_key"] = combined["patient_group_key"]
+        combined["dataset_memberships"] = "; ".join(memberships)
+        combined["dataset_count"] = len(member_titles)
+        combined["member_short_titles_json"] = json.dumps(
+            member_titles, separators=(",", ":")
+        )
+        combined["member_patient_keys_json"] = json.dumps(
+            member_keys, separators=(",", ":")
+        )
+        combined["is_grouped_patient"] = len(member_titles) > 1
+
+        for column in (
+            "available_imaging",
+            "modalities",
+            "body_parts",
+            "source_kinds",
+        ):
+            if column in group:
+                combined[column] = join_tokens(group[column].tolist())
+        for column in (
+            "dicom_series",
+            "dicom_studies",
+            "dicom_timepoints",
+            "nifti_files",
+            "nifti_studies",
+            "nifti_timepoints",
+            "pathdb_slides",
+            "pathdb_viewable_slides",
+            "controlled_files",
+            "controlled_series",
+            "controlled_studies",
+            "controlled_timepoints",
+            "conflict_count",
+            "source_count",
+        ):
+            if column in group:
+                combined[column] = pd.to_numeric(
+                    group[column], errors="coerce"
+                ).max(skipna=True)
+        for column in (
+            "has_clinical",
+            "has_idc_dicom_metadata",
+            "has_public_dicom",
+            "has_pathdb",
+            "has_nifti",
+            "has_controlled_metadata",
+            "has_pathology_aspera",
+            "has_any_imaging",
+        ):
+            if column in group:
+                combined[column] = bool(group[column].fillna(False).astype(bool).any())
+
+        access_values = {
+            str(value).strip()
+            for value in group.get(
+                "resolved_access_level", pd.Series(dtype=str)
+            ).dropna()
+            if str(value).strip()
+        }
+        if len(access_values) == 1:
+            combined["resolved_access_level"] = next(iter(access_values))
+        elif access_values and access_values.issubset(OPEN_ACCESS_LEVELS):
+            combined["resolved_access_level"] = (
+                "open_noncommercial"
+                if "open_noncommercial" in access_values
+                else "open"
+            )
+        elif access_values:
+            combined["resolved_access_level"] = "mixed"
+        return combined
+
+    group_sizes = ordered["patient_group_key"].value_counts()
+    single_keys = set(group_sizes[group_sizes == 1].index)
+    singles = ordered[ordered["patient_group_key"].isin(single_keys)].copy()
+    singles["dataset_memberships"] = singles.apply(
+        lambda row: f"{row['short_title']} [{row.get('dataset_type', 'Dataset')}]",
+        axis=1,
+    )
+    singles["dataset_count"] = 1
+    singles["member_short_titles_json"] = singles["short_title"].map(
+        lambda value: json.dumps([str(value)], separators=(",", ":"))
+    )
+    singles["member_patient_keys_json"] = singles["patient_key"].map(
+        lambda value: json.dumps([str(value)], separators=(",", ":"))
+    )
+    singles["is_grouped_patient"] = False
+
+    grouped_rows = [
+        decorate(group)
+        for _, group in ordered[
+            ~ordered["patient_group_key"].isin(single_keys)
+        ].groupby("patient_group_key", sort=False)
+    ]
+    grouped = pd.concat(
+        [singles, pd.DataFrame(grouped_rows)], ignore_index=True, sort=False
+    )
+    grouped = grouped.sort_values(
+        ["short_title", "subject_id"],
+        key=lambda series: series.astype(str).str.casefold(),
+    ).reset_index(drop=True)
+    return grouped, members
+
+
 def load_patient_clinical_facts(
     path: Path,
     short_title: str,
@@ -975,6 +1190,7 @@ def load_patient_idc(
     subject_id: str,
     collection_id: str | None = None,
     analysis_result_id: str | None = None,
+    direct_collection_only: bool = False,
 ) -> pd.DataFrame:
     if not paths.idc_parquet.exists():
         return pd.DataFrame()
@@ -995,6 +1211,9 @@ def load_patient_idc(
         frame = load_idc_series(paths.idc_parquet, catalog)
     if frame.empty:
         return frame
+    if direct_collection_only and not analysis_result_id and "analysis_result_id" in frame:
+        result_ids = frame["analysis_result_id"].fillna("").astype(str).str.strip()
+        frame = frame[result_ids == ""].copy()
     selected_key = subject_join_key(short_title, subject_id)
     frame_subject_keys = frame.apply(
         lambda row: subject_join_key(row["short_title"], row["subject_id"]),
@@ -1248,6 +1467,324 @@ def build_manifest_download(
     return (
         buffer.getvalue(),
         "tcia_data_retriever_manifests.zip",
+        "application/zip",
+        counts,
+    )
+
+
+def _cohort_export_patients(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return the resolved patient-level fields intended for cohort export."""
+    columns = [column for column in COHORT_EXPORT_COLUMNS if column in frame]
+    return frame[columns].copy()
+
+
+def _match_export_rows_to_patients(
+    rows: pd.DataFrame, patients: pd.DataFrame
+) -> pd.DataFrame:
+    if rows.empty or patients.empty:
+        return rows.iloc[0:0].copy()
+    source = rows.copy()
+    source["subject_join_key"] = subject_join_keys(source)
+    selected = patients[["short_title", "subject_id"]].copy()
+    selected["subject_join_key"] = subject_join_keys(selected)
+    selected = selected[["short_title", "subject_join_key"]].drop_duplicates()
+    return source.merge(
+        selected,
+        on=["short_title", "subject_join_key"],
+        how="inner",
+        validate="many_to_one",
+    )
+
+
+def _filter_export_tokens(
+    frame: pd.DataFrame, column: str, selected: Sequence[str]
+) -> pd.DataFrame:
+    if frame.empty or not selected or column not in frame:
+        return frame
+    wanted = {
+        str(value).strip().casefold() for value in selected if str(value).strip()
+    }
+    return frame[
+        frame[column].map(
+            lambda value: bool(
+                wanted.intersection(token.casefold() for token in split_tokens(value))
+            )
+        )
+    ].copy()
+
+
+def _read_export_rows(
+    path: Path,
+    source_names: Sequence[str],
+    select_sql: str,
+    dataset_column: str,
+    short_titles: Sequence[str],
+) -> pd.DataFrame:
+    source = preferred_object(path, *source_names)
+    if not source or not short_titles:
+        return pd.DataFrame()
+    placeholders = ",".join("?" for _ in short_titles)
+    return read_sql(
+        path,
+        f"""
+        SELECT {select_sql}
+        FROM {source}
+        WHERE lower({dataset_column}) IN ({placeholders})
+        """,
+        tuple(value.casefold() for value in short_titles),
+    )
+
+
+def collect_filtered_imaging_routes(
+    paths: DataPaths,
+    catalog: pd.DataFrame,
+    patients: pd.DataFrame,
+    *,
+    imaging_sources: Sequence[str] = (),
+    modalities: Sequence[str] = (),
+    body_parts: Sequence[str] = (),
+    direct_collection_titles: Sequence[str] = (),
+) -> tuple[dict[str, list[str]], pd.DataFrame]:
+    """Collect route values and auditable unrouted rows for a filtered cohort."""
+    routes: dict[str, list[str]] = {}
+    unrouted: list[pd.DataFrame] = []
+    if patients.empty:
+        return routes, pd.DataFrame()
+
+    requested = set(imaging_sources) or {
+        "IDC DICOM",
+        "NIfTI",
+        "PathDB",
+        "Controlled-access file metadata",
+    }
+    short_titles = sorted(set(patients["short_title"].dropna().astype(str)))
+
+    def filter_rows(frame: pd.DataFrame) -> pd.DataFrame:
+        matched = _match_export_rows_to_patients(frame, patients)
+        matched = _filter_export_tokens(matched, "modality", modalities)
+        return _filter_export_tokens(matched, "body_part_examined", body_parts)
+
+    def retain_unrouted(
+        frame: pd.DataFrame, source: str, label_column: str, reason: str
+    ) -> None:
+        if frame.empty:
+            return
+        result = pd.DataFrame(
+            {
+                "source": source,
+                "short_title": frame["short_title"],
+                "subject_id": frame["subject_id"],
+                "modality": frame.get("modality", ""),
+                "body_part_examined": frame.get("body_part_examined", ""),
+                "item": frame.get(label_column, ""),
+                "reason": reason,
+            }
+        )
+        unrouted.append(result)
+
+    if "IDC DICOM" in requested and paths.idc_parquet.exists():
+        analysis_values = patients.get(
+            "idc_analysis_result_id", pd.Series(index=patients.index, dtype=str)
+        ).fillna("").astype(str).str.strip()
+        collection_ids = (
+            sorted(
+                {
+                    str(value).strip()
+                    for value in patients.loc[
+                        analysis_values == "", "idc_collection_id"
+                    ].dropna()
+                    if str(value).strip()
+                }
+            )
+            if "idc_collection_id" in patients
+            else []
+        )
+        analysis_ids = sorted(
+            {
+                str(value).strip()
+                for value in analysis_values
+                if str(value).strip()
+            }
+        )
+        parquet_filters = []
+        if collection_ids:
+            parquet_filters.append([("collection_id", "in", collection_ids)])
+        if analysis_ids:
+            parquet_filters.append([("analysis_result_id", "in", analysis_ids)])
+        dicom = load_idc_series(
+            paths.idc_parquet,
+            catalog,
+            columns=[
+                "collection_id",
+                "analysis_result_id",
+                "PatientID",
+                "SeriesInstanceUID",
+                "Modality",
+                "BodyPartExamined",
+            ],
+            filters=parquet_filters or None,
+        ).rename(
+            columns={"Modality": "modality", "BodyPartExamined": "body_part_examined"}
+        )
+        if direct_collection_titles and "analysis_result_id" in dicom:
+            derived_ids = (
+                dicom["analysis_result_id"].fillna("").astype(str).str.strip()
+            )
+            derived_collection_rows = (
+                dicom["short_title"].isin(direct_collection_titles)
+                & (derived_ids != "")
+            )
+            dicom = dicom[~derived_collection_rows].copy()
+        dicom = filter_rows(dicom)
+        routed = dicom["SeriesInstanceUID"].fillna("").astype(str).str.strip() != ""
+        routes["SeriesInstanceUID"] = (
+            dicom.loc[routed, "SeriesInstanceUID"].astype(str).tolist()
+        )
+        retain_unrouted(
+            dicom.loc[~routed],
+            "IDC DICOM",
+            "SeriesInstanceUID",
+            "Series Instance UID is missing.",
+        )
+
+    if "PathDB" in requested:
+        pathdb = _read_export_rows(
+            paths.snapshot_db,
+            ("agent_pathdb_slides", "pathdb_rows"),
+            (
+                "collection AS short_title, TRIM(patient_id) AS subject_id, "
+                "slide_id, wsiimage_url AS imageUrl, modality, "
+                "cancer_location AS body_part_examined"
+            ),
+            "collection",
+            short_titles,
+        )
+        pathdb = filter_rows(pathdb)
+        routed = (
+            pathdb.get("imageUrl", pd.Series(index=pathdb.index, dtype=str))
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            != ""
+        )
+        routes["imageUrl"] = pathdb.loc[routed, "imageUrl"].astype(str).tolist()
+        retain_unrouted(
+            pathdb.loc[~routed],
+            "PathDB",
+            "slide_id",
+            "No direct imageUrl is available.",
+        )
+
+    if "Controlled-access file metadata" in requested:
+        controlled = _read_export_rows(
+            paths.controlled_db,
+            ("agent_controlled_files", "controlled_files"),
+            (
+                "short_title, COALESCE(NULLIF(TRIM(patient_id), ''), "
+                "NULLIF(TRIM(participant_id), '')) AS subject_id, file_name, "
+                "drs_uri, COALESCE(NULLIF(modality, ''), image_modality) AS modality, "
+                "body_part_examined"
+            ),
+            "short_title",
+            short_titles,
+        )
+        controlled = filter_rows(controlled)
+        routed = (
+            controlled.get("drs_uri", pd.Series(index=controlled.index, dtype=str))
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            != ""
+        )
+        routes["drs_uri"] = controlled.loc[routed, "drs_uri"].astype(str).tolist()
+        retain_unrouted(
+            controlled.loc[~routed],
+            "Controlled-access metadata",
+            "file_name",
+            "No authorized DRS route is available in the metadata.",
+        )
+
+    if "NIfTI" in requested:
+        nifti = _read_export_rows(
+            paths.nifti_db,
+            ("agent_nifti_files", "radiology_series"),
+            (
+                "short_title, TRIM(subject_id) AS subject_id, file_name, "
+                "package_path, modality, body_part_examined"
+            ),
+            "short_title",
+            short_titles,
+        )
+        nifti = filter_rows(nifti)
+        retain_unrouted(
+            nifti,
+            "NIfTI",
+            "file_name",
+            "Package metadata has no supported TCIA Data Retriever route.",
+        )
+
+    clean_routes = {
+        header: sorted(set(value for value in values if str(value).strip()))
+        for header, values in routes.items()
+        if values
+    }
+    unrouted_frame = (
+        pd.concat(unrouted, ignore_index=True, sort=False).drop_duplicates()
+        if unrouted
+        else pd.DataFrame()
+    )
+    return clean_routes, unrouted_frame
+
+
+def build_filtered_cohort_download(
+    patients: pd.DataFrame,
+    routes: Mapping[str, Sequence[str]],
+    unrouted: pd.DataFrame | None = None,
+) -> tuple[bytes, str, str, dict[str, int]]:
+    """Build a clinical CSV plus route-specific Data Retriever manifests."""
+    if patients.empty:
+        raise ValueError("The filtered cohort is empty.")
+    route_names = {
+        "SeriesInstanceUID": "tcia_dicom_series.csv",
+        "imageUrl": "tcia_pathdb_files.csv",
+        "drs_uri": "tcia_controlled_drs.csv",
+    }
+    counts = {"patients": len(patients)}
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        patient_csv = (
+            _cohort_export_patients(patients).to_csv(index=False).encode("utf-8")
+        )
+        archive.writestr("tcia_filtered_patients.csv", patient_csv)
+        for header, values in routes.items():
+            clean_values = sorted(
+                set(str(value).strip() for value in values if str(value).strip())
+            )
+            if not clean_values or header not in route_names:
+                continue
+            archive.writestr(route_names[header], _manifest_csv(header, clean_values))
+            counts[header] = len(clean_values)
+        if unrouted is not None and not unrouted.empty:
+            archive.writestr(
+                "tcia_unrouted_imaging_inventory.csv",
+                unrouted.to_csv(index=False).encode("utf-8"),
+            )
+            counts["unrouted_imaging"] = len(unrouted)
+        archive.writestr(
+            "README.txt",
+            (
+                "This package contains one row per filtered dataset-scoped patient in "
+                "tcia_filtered_patients.csv. Extract the package and open one route-specific "
+                "CSV at a time with TCIA Data Retriever. SeriesInstanceUID routes public "
+                "DICOM, imageUrl routes direct public files, and drs_uri routes authorized "
+                "controlled files. Controlled routes still require approval and API-key "
+                "configuration. The unrouted inventory, when present, is metadata for imaging "
+                "that has no supported Data Retriever route; it is not a download manifest.\n"
+            ),
+        )
+    return (
+        buffer.getvalue(),
+        "tcia_filtered_cohort_export.zip",
         "application/zip",
         counts,
     )
