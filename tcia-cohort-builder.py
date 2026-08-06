@@ -27,13 +27,14 @@ from cohort_builder_data import (
     load_patient_controlled,
     load_patient_idc,
     load_patient_nifti,
+    load_patient_nifti_packages,
     load_patient_pathdb,
     resolve_data_paths,
     split_tokens,
 )
 
 
-PATIENT_INDEX_SCHEMA_VERSION = 3
+PATIENT_INDEX_SCHEMA_VERSION = 4
 APP_DIR = Path(__file__).resolve().parent
 BRAND_SKILL_DIR = Path.home() / ".codex" / "skills" / "tcia-brand-guidelines"
 LOGO_PATH = BRAND_SKILL_DIR / "assets" / "tcia-logo-dark.svg"
@@ -544,6 +545,9 @@ def render_imaging(
     )
     pathdb = load_patient_pathdb(paths.snapshot_db, short_title, pathdb_subject)
     nifti = load_patient_nifti(paths.nifti_db, short_title, nifti_subject)
+    nifti_packages = load_patient_nifti_packages(
+        paths.nifti_db, short_title, nifti_subject
+    )
     controlled = load_patient_controlled(paths.controlled_db, short_title, controlled_subject)
 
     source_tabs = st.tabs(
@@ -604,7 +608,34 @@ def render_imaging(
         else:
             columns = [column for column in ("study_date", "modality", "series_description", "file_name", "package_path", "quality_flag_json") if column in nifti]
             st.dataframe(nifti[columns], hide_index=True, width="stretch")
-            st.caption("Package paths are metadata-only until a validated Data Retriever route is available.")
+            if nifti_packages.empty:
+                st.caption(
+                    "Individual package paths are metadata-only and are not "
+                    "direct Data Retriever routes. No verified public Aspera "
+                    "package link is available for these files."
+                )
+            else:
+                st.caption(
+                    "Individual package paths are metadata-only and are not direct "
+                    "Data Retriever routes. The links below open the full Aspera "
+                    "package(s) containing these files."
+                )
+                for _, package in nifti_packages.iterrows():
+                    package_id = str(package.get("download_id", "")).strip()
+                    label = str(package.get("download_label", "")).strip()
+                    if not label:
+                        label = str(package.get("download_title", "")).strip()
+                    if not label:
+                        label = (
+                            f"Aspera package {package_id}"
+                            if package_id
+                            else "Aspera package"
+                        )
+                    st.link_button(
+                        f"Open containing Aspera package · {label}",
+                        str(package["download_url"]),
+                        width="content",
+                    )
 
     with source_tabs[2]:
         if pathdb.empty:

@@ -23,6 +23,7 @@ from cohort_builder_data import (
     load_clinical_subjects,
     load_idc_series,
     load_patient_idc,
+    load_patient_nifti_packages,
     normalize_dataset_key,
     normalize_subject_key,
     subject_join_key,
@@ -32,6 +33,83 @@ import pandas as pd
 
 
 class CohortBuilderDataTests(unittest.TestCase):
+    def test_patient_nifti_packages_are_subject_scoped_and_public(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "nifti.sqlite"
+            with sqlite3.connect(path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE radiology_series (
+                        short_title TEXT,
+                        subject_id TEXT,
+                        download_ids TEXT
+                    )
+                    """
+                )
+                connection.executemany(
+                    "INSERT INTO radiology_series VALUES (?, ?, ?)",
+                    [
+                        ("Result-A", "P1", '["10"]'),
+                        ("Result-A", "p1", '["10"]'),
+                        ("Result-A", "P2", '["20"]'),
+                    ],
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE nifti_downloads (
+                        short_title TEXT,
+                        download_id TEXT,
+                        download_label TEXT,
+                        download_title TEXT,
+                        download_url TEXT,
+                        download_size TEXT,
+                        download_size_unit TEXT,
+                        access_level TEXT
+                    )
+                    """
+                )
+                connection.executemany(
+                    "INSERT INTO nifti_downloads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            "Result-A",
+                            "10",
+                            "P1 package",
+                            "",
+                            "https://faspex.cancerimagingarchive.net/aspera/faspex/public/package?context=p1",
+                            "1",
+                            "GB",
+                            "open",
+                        ),
+                        (
+                            "Result-A",
+                            "20",
+                            "P2 package",
+                            "",
+                            "https://faspex.cancerimagingarchive.net/aspera/faspex/public/package?context=p2",
+                            "2",
+                            "GB",
+                            "open",
+                        ),
+                        (
+                            "Result-A",
+                            "10",
+                            "Untrusted route",
+                            "",
+                            "https://example.org/package?id=10",
+                            "1",
+                            "GB",
+                            "open",
+                        ),
+                    ],
+                )
+
+            packages = load_patient_nifti_packages(path, "result-a", "p1")
+
+            self.assertEqual(len(packages), 1)
+            self.assertEqual(packages.iloc[0]["download_id"], "10")
+            self.assertEqual(packages.iloc[0]["download_label"], "P1 package")
+
     def test_dataset_keys_match_idc_style_names(self):
         self.assertEqual(
             normalize_dataset_key("NSCLC-Radiomics"), normalize_dataset_key("nsclc_radiomics")
@@ -295,6 +373,106 @@ class CohortBuilderDataTests(unittest.TestCase):
             memberships["patient_group_key"] == combined["patient_group_key"]
         ]
         self.assertEqual(set(grouped_members["short_title"]), {"Source-Collection", "Derived-Result"})
+
+    def test_explicit_source_collection_groups_non_idc_analysis_result(self):
+        patients = pd.DataFrame(
+            [
+                {
+                    "patient_key": "TCGA-LGG|TCGA-CS-4944",
+                    "short_title": "TCGA-LGG",
+                    "dataset_type": "Collection",
+                    "subject_id": "TCGA-CS-4944",
+                    "source_collections": "",
+                    "has_clinical": True,
+                    "has_controlled_metadata": True,
+                    "controlled_files": 11,
+                    "resolved_access_level": "controlled",
+                },
+                {
+                    "patient_key": "BraTS-TCGA-LGG|TCGA-CS-4944",
+                    "short_title": "BraTS-TCGA-LGG",
+                    "dataset_type": "Analysis Result",
+                    "subject_id": "tcga-cs-4944",
+                    "source_collections": (
+                        "Corresponding Original Images from TCGA-LGG (DICOM)."
+                    ),
+                    "has_clinical": False,
+                    "has_nifti": True,
+                    "nifti_files": 6,
+                    "resolved_access_level": "open",
+                },
+                {
+                    "patient_key": "Unrelated|TCGA-CS-4944",
+                    "short_title": "Unrelated",
+                    "dataset_type": "Collection",
+                    "subject_id": "TCGA-CS-4944",
+                    "source_collections": "",
+                    "has_clinical": False,
+                    "resolved_access_level": "open",
+                },
+            ]
+        )
+
+        grouped, memberships = build_grouped_patient_index(patients)
+
+        self.assertEqual(len(grouped), 2)
+        combined = grouped[grouped["dataset_count"] == 2].iloc[0]
+        self.assertEqual(combined["short_title"], "TCGA-LGG")
+        self.assertEqual(combined["resolved_access_level"], "mixed")
+        self.assertEqual(int(combined["controlled_files"]), 11)
+        self.assertEqual(int(combined["nifti_files"]), 6)
+        self.assertIn("TCGA-LGG [Collection]", combined["dataset_memberships"])
+        self.assertIn(
+            "BraTS-TCGA-LGG [Analysis Result]",
+            combined["dataset_memberships"],
+        )
+        grouped_members = memberships[
+            memberships["patient_group_key"] == combined["patient_group_key"]
+        ]
+        self.assertEqual(
+            set(grouped_members["short_title"]),
+            {"TCGA-LGG", "BraTS-TCGA-LGG"},
+        )
+
+    def test_explicit_relationship_requires_exact_subject_and_one_source(self):
+        patients = pd.DataFrame(
+            [
+                {
+                    "patient_key": "Source-A|P1",
+                    "short_title": "Source-A",
+                    "dataset_type": "Collection",
+                    "subject_id": "P1",
+                },
+                {
+                    "patient_key": "Source-B|P1",
+                    "short_title": "Source-B",
+                    "dataset_type": "Collection",
+                    "subject_id": "P1",
+                },
+                {
+                    "patient_key": "Ambiguous-Result|P1",
+                    "short_title": "Ambiguous-Result",
+                    "dataset_type": "Analysis Result",
+                    "subject_id": "P1",
+                    "source_collections": "Source-A; Source-B",
+                },
+                {
+                    "patient_key": "Source-A-Result|P2",
+                    "short_title": "Source-A-Result",
+                    "dataset_type": "Analysis Result",
+                    "subject_id": "P2",
+                    "source_collections": "Source-A",
+                },
+            ]
+        )
+
+        grouped, memberships = build_grouped_patient_index(patients)
+
+        self.assertEqual(len(grouped), 4)
+        self.assertTrue((grouped["dataset_count"] == 1).all())
+        self.assertTrue(
+            (memberships["patient_group_key"] == memberships["patient_key"]).all()
+        )
 
     def test_clinical_loader_uses_complete_subject_view(self):
         with tempfile.TemporaryDirectory() as directory:

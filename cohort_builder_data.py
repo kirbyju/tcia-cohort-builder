@@ -19,7 +19,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import pandas as pd
 
@@ -853,6 +853,7 @@ def build_patient_index(paths: DataPaths) -> pd.DataFrame:
             "cancer_types",
             "cancer_locations",
             "program",
+            "source_collections",
             "resolved_access_level",
             "resolved_controlled_access_policy_url",
             "licenses",
@@ -989,8 +990,9 @@ def build_grouped_patient_index(
     """Group verified Collection/Analysis Result memberships for presentation.
 
     The returned membership frame preserves every dataset-scoped source row.
-    Grouping is allowed only when IDC supplies the same collection identifier
-    and normalized PatientID for at least one Collection and Analysis Result.
+    Grouping is allowed when IDC supplies the same collection identifier and
+    normalized PatientID, or when an Analysis Result explicitly names one
+    source Collection in WordPress and the normalized PatientID matches exactly.
     """
     if frame.empty:
         empty = frame.copy()
@@ -1022,6 +1024,49 @@ def build_grouped_patient_index(
     )
     verified = eligible & candidates.isin(verified_keys)
     members.loc[verified, "patient_group_key"] = candidates.loc[verified]
+
+    # Non-DICOM Analysis Results such as NIfTI packages may not have IDC
+    # collection identifiers even though WordPress explicitly identifies their
+    # source Collection. Extend grouping only for exact subject matches with one
+    # unambiguous, explicitly named Collection membership.
+    def explicitly_names_collection(evidence: object, short_title: object) -> bool:
+        if not _present(evidence) or not _present(short_title):
+            return False
+        pattern = (
+            r"(?<![A-Za-z0-9_-])"
+            + re.escape(str(short_title).strip())
+            + r"(?![A-Za-z0-9_-])"
+        )
+        return re.search(pattern, str(evidence), flags=re.IGNORECASE) is not None
+
+    collection_rows_by_subject: dict[str, list[tuple[str, str]]] = {}
+    collection_rows = members[members["dataset_type"] == "Collection"]
+    for row in collection_rows.itertuples(index=False):
+        subject_key = normalize_subject_key(getattr(row, "subject_id", ""))
+        if not subject_key:
+            continue
+        collection_rows_by_subject.setdefault(subject_key, []).append(
+            (str(row.short_title), str(row.patient_group_key))
+        )
+
+    ungrouped_results = members[
+        (members["dataset_type"] == "Analysis Result")
+        & (members["patient_group_key"] == members["patient_key"])
+    ]
+    for row in ungrouped_results.itertuples(index=True):
+        subject_key = normalize_subject_key(getattr(row, "subject_id", ""))
+        evidence = getattr(row, "source_collections", "")
+        matched_group_keys = {
+            group_key
+            for short_title, group_key in collection_rows_by_subject.get(
+                subject_key, []
+            )
+            if explicitly_names_collection(evidence, short_title)
+        }
+        if len(matched_group_keys) == 1:
+            members.at[row.Index, "patient_group_key"] = next(
+                iter(matched_group_keys)
+            )
 
     type_rank = members.get("dataset_type", "").map(
         lambda value: 0 if value == "Collection" else 1
@@ -1099,7 +1144,9 @@ def build_grouped_patient_index(
             "has_any_imaging",
         ):
             if column in group:
-                combined[column] = bool(group[column].fillna(False).astype(bool).any())
+                combined[column] = bool(
+                    group[column].astype("boolean").fillna(False).any()
+                )
 
         access_values = {
             str(value).strip()
@@ -1271,6 +1318,93 @@ def load_patient_nifti(
         """,
         (short_title, subject_id),
     )
+
+
+def load_patient_nifti_packages(
+    path: Path, short_title: str, subject_id: str
+) -> pd.DataFrame:
+    """Return verified public Aspera packages containing a patient's NIfTI files."""
+    file_source = preferred_object(path, "agent_nifti_files", "radiology_series")
+    download_source = preferred_object(path, "agent_nifti_downloads", "nifti_downloads")
+    columns = [
+        "download_id",
+        "download_label",
+        "download_title",
+        "download_url",
+        "download_size",
+        "download_size_unit",
+        "access_level",
+    ]
+    if not file_source or not download_source:
+        return pd.DataFrame(columns=columns)
+
+    file_columns = read_sql(path, f"SELECT * FROM {file_source} LIMIT 0").columns
+    download_id_column = next(
+        (name for name in ("download_ids", "download_id") if name in file_columns),
+        None,
+    )
+    if not download_id_column:
+        return pd.DataFrame(columns=columns)
+
+    file_downloads = read_sql(
+        path,
+        f"""
+        SELECT {download_id_column} AS download_ids
+        FROM {file_source}
+        WHERE lower(short_title) = lower(?) AND lower(subject_id) = lower(?)
+        """,
+        (short_title, subject_id),
+    )
+    associated_ids = {
+        token.casefold()
+        for value in file_downloads.get("download_ids", pd.Series(dtype="object"))
+        for token in split_tokens(value)
+    }
+    if not associated_ids:
+        return pd.DataFrame(columns=columns)
+
+    download_columns = read_sql(
+        path, f"SELECT * FROM {download_source} LIMIT 0"
+    ).columns
+    required = {"short_title", "download_id", "download_url"}
+    if not required.issubset(download_columns):
+        return pd.DataFrame(columns=columns)
+    select_columns = [column for column in columns if column in download_columns]
+    packages = read_sql(
+        path,
+        f"""
+        SELECT {', '.join(select_columns)}
+        FROM {download_source}
+        WHERE lower(short_title) = lower(?)
+          AND COALESCE(TRIM(download_url), '') <> ''
+        """,
+        (short_title,),
+    )
+    if packages.empty:
+        return pd.DataFrame(columns=columns)
+
+    package_ids = packages["download_id"].fillna("").astype(str).str.strip().str.casefold()
+    packages = packages[package_ids.isin(associated_ids)].copy()
+    if packages.empty:
+        return pd.DataFrame(columns=columns)
+
+    def is_public_aspera_package(value: object) -> bool:
+        parsed = urlparse(str(value).strip())
+        return (
+            parsed.scheme == "https"
+            and (parsed.hostname or "").casefold()
+            == "faspex.cancerimagingarchive.net"
+            and parsed.path.rstrip("/") == "/aspera/faspex/public/package"
+        )
+
+    packages = packages[packages["download_url"].map(is_public_aspera_package)]
+    packages = packages.drop_duplicates(subset=["download_url"], keep="first")
+    for column in columns:
+        if column not in packages:
+            packages[column] = ""
+    return packages[columns].sort_values(
+        ["download_label", "download_id"], kind="stable", na_position="last"
+    ).reset_index(drop=True)
 
 
 def load_patient_controlled(

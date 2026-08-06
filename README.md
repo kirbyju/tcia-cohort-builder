@@ -77,9 +77,11 @@ python -m unittest discover -s tests -v
 ```
 
 The patient count is intentionally not the raw clinical row count. Verified
-dataset-specific aliases are collapsed; related Collection and Analysis Result
-memberships are grouped only when IDC supplies the same collection identity and
-exact PatientID. Unrelated datasets that reuse a PatientID remain separate.
+dataset-specific aliases are collapsed. Related Collection and Analysis Result
+memberships are grouped when IDC supplies the same collection identity and
+exact PatientID, or when WordPress explicitly identifies one source Collection
+and that Collection contains the exact PatientID. Unrelated or ambiguous
+dataset memberships remain separate.
 
 ## Branding
 
