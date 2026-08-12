@@ -19,7 +19,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import pandas as pd
 
@@ -1390,11 +1390,13 @@ def load_patient_nifti_packages(
 
     def is_public_aspera_package(value: object) -> bool:
         parsed = urlparse(str(value).strip())
+        allowed_paths = {"", "/aspera/faspex/public/package"}
         return (
             parsed.scheme == "https"
             and (parsed.hostname or "").casefold()
             == "faspex.cancerimagingarchive.net"
-            and parsed.path.rstrip("/") == "/aspera/faspex/public/package"
+            and parsed.path.rstrip("/") in allowed_paths
+            and bool(parse_qs(parsed.query).get("context"))
         )
 
     packages = packages[packages["download_url"].map(is_public_aspera_package)]

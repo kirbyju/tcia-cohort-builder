@@ -70,6 +70,23 @@ The refresh writes to a temporary Parquet file and replaces the current index
 only after the complete IDC export succeeds. The daily GitHub Actions workflow
 uses the same command.
 
+## Alpha server update
+
+After revised code and matching SQLite release assets have been published, the
+Ubuntu deployment can be updated in place with:
+
+```bash
+cd /home/exouser/tcia-cohort-builder
+./scripts/update_server.sh
+```
+
+The script stops the three user services, fast-forwards both repositories,
+updates their virtual environments, downloads and validates all five published
+SQLite artifacts, restarts the services, and checks the public health URLs. Run
+it as `exouser`, not with `sudo`. Its default paths match the documented alpha
+server and can be changed with the environment overrides shown by
+`./scripts/update_server.sh --help`.
+
 ## Tests
 
 ```bash

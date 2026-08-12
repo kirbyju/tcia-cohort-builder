@@ -52,6 +52,7 @@ class CohortBuilderDataTests(unittest.TestCase):
                         ("Result-A", "P1", '["10"]'),
                         ("Result-A", "p1", '["10"]'),
                         ("Result-A", "P2", '["20"]'),
+                        ("BraTS-PEDs", "BraTS-PED-00001", '["53630"]'),
                     ],
                 )
                 connection.execute(
@@ -101,6 +102,16 @@ class CohortBuilderDataTests(unittest.TestCase):
                             "GB",
                             "open",
                         ),
+                        (
+                            "BraTS-PEDs",
+                            "53630",
+                            "Images (Training and Validation)",
+                            "",
+                            "https://faspex.cancerimagingarchive.net/?context=brats-peds",
+                            "32.7",
+                            "GB",
+                            "open",
+                        ),
                     ],
                 )
 
@@ -109,6 +120,17 @@ class CohortBuilderDataTests(unittest.TestCase):
             self.assertEqual(len(packages), 1)
             self.assertEqual(packages.iloc[0]["download_id"], "10")
             self.assertEqual(packages.iloc[0]["download_label"], "P1 package")
+
+            brats_packages = load_patient_nifti_packages(
+                path, "BraTS-PEDs", "BraTS-PED-00001"
+            )
+
+            self.assertEqual(len(brats_packages), 1)
+            self.assertEqual(brats_packages.iloc[0]["download_id"], "53630")
+            self.assertEqual(
+                brats_packages.iloc[0]["download_label"],
+                "Images (Training and Validation)",
+            )
 
     def test_dataset_keys_match_idc_style_names(self):
         self.assertEqual(
