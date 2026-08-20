@@ -1,15 +1,16 @@
-"""Read and validate an installed TCIA Metadata Artifact Model V2 bundle.
+"""Install, read, and validate a TCIA Metadata Artifact Model V2 bundle.
 
 The authoritative installer lives in the tcia-query-skill repository.  This
-module deliberately does not download or replace multi-gigabyte artifacts from
-inside a Streamlit rerun; it verifies the install receipt and exposes the
-installed components to the application.
+module invokes that installer once during Streamlit startup, then verifies the
+official install receipt and exposes installed components to the application.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,17 @@ SUPPORTED_COMPONENTS = {
     "public_non_dicom": {"schema_version": 7, "profile": "research_detail"},
     "controlled_access": {"schema_version": 2, "profile": "research_detail"},
     "clinical": {"schema_version": 17, "profile": "research_detail"},
+}
+SUPPORTED_INSTALL_PROFILES = {"research_core", "research_detail", "audit_support"}
+PROFILE_COMPONENTS = {
+    "research_core": ("snapshot", "participant_inventory"),
+    "research_detail": (
+        "snapshot",
+        "participant_inventory",
+        "public_non_dicom",
+        "controlled_access",
+        "clinical",
+    ),
 }
 
 
@@ -56,6 +68,97 @@ class ComponentCache:
     profile: str
     storage_contract: dict[str, Any]
     provenance: dict[str, Any]
+
+
+def install_bundle_profile(
+    skill_root: Path,
+    cache_dir: Path,
+    *,
+    profile: str = "research_detail",
+    python_executable: str | None = None,
+    timeout_seconds: int = 3600,
+) -> dict[str, Any]:
+    """Run the query skill's manifest-pinned bundle installer.
+
+    The installer owns download validation, SQLite integrity checks, and atomic
+    replacement so the Streamlit app does not maintain a second release client.
+    """
+    if profile not in SUPPORTED_INSTALL_PROFILES:
+        raise ValueError(f"Unsupported V2 install profile: {profile}")
+    root = skill_root.expanduser().resolve()
+    installer = root / "scripts" / "tcia_v2_bundle.py"
+    if not installer.is_file():
+        raise RuntimeError(f"TCIA V2 bundle installer not found: {installer}")
+    directory = cache_dir.expanduser().resolve()
+    command = [
+        python_executable or sys.executable,
+        str(installer),
+        "install",
+        "--tag",
+        V2_RELEASE_TAG,
+        "--profile",
+        profile,
+        "--install-dir",
+        str(directory),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"TCIA V2 {profile} installation exceeded {timeout_seconds} seconds"
+        ) from exc
+    if completed.returncode != 0:
+        details = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(
+            f"TCIA V2 {profile} installation failed"
+            + (f": {details}" if details else "")
+        )
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("TCIA V2 installer returned invalid JSON") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("TCIA V2 installer returned an unexpected result")
+    return result
+
+
+def ensure_bundle_profile(
+    skill_root: Path,
+    cache_dir: Path,
+    *,
+    profile: str = "research_detail",
+    python_executable: str | None = None,
+    timeout_seconds: int = 3600,
+) -> dict[str, Any]:
+    """Install a profile only when its required app components are absent."""
+    required_components = PROFILE_COMPONENTS.get(profile)
+    if required_components and all(
+        installed_component(cache_dir, name) is not None
+        for name in required_components
+    ):
+        installation = load_bundle_installation(cache_dir)
+        return {
+            "status": "already_installed",
+            "install_dir": str(installation.directory),
+            "profile": profile,
+            "release_tag": installation.release_tag,
+            "release_fingerprint": installation.release_fingerprint,
+            "downloaded_assets": [],
+        }
+    return install_bundle_profile(
+        skill_root,
+        cache_dir,
+        profile=profile,
+        python_executable=python_executable,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def _load_json(path: Path, label: str) -> dict[str, Any]:

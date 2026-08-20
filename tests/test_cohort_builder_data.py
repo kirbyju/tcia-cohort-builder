@@ -20,6 +20,7 @@ from cohort_builder_data import (
     cart_item,
     collapse_clinical_subject_aliases,
     collect_filtered_imaging_routes,
+    count_visible_dataset_contexts,
     deduplicate_cart,
     enrich_participants_with_clinical_detail,
     exclude_nlst_clinical_only,
@@ -30,6 +31,7 @@ from cohort_builder_data import (
     load_idc_patient_search_summary,
     load_dataset_aspera_packages,
     load_patient_idc,
+    load_patient_idc_scope,
     load_patient_clinical_longitudinal,
     load_patient_nifti_packages,
     load_patient_public_non_dicom,
@@ -735,6 +737,51 @@ class CohortBuilderDataTests(unittest.TestCase):
             self.assertEqual(derived["idc_analysis_result_id"], "Derived-Result")
             self.assertEqual(int(derived["dicom_series"]), 1)
 
+            search_summary = load_idc_patient_search_summary(parquet_path, catalog)
+            source_summary = search_summary[
+                search_summary["short_title"] == "Source-Collection"
+            ].iloc[0]
+            derived_summary = search_summary[
+                search_summary["short_title"] == "Derived-Result"
+            ].iloc[0]
+            self.assertEqual(source_summary["idc_subject_id"], "P1")
+            self.assertEqual(source_summary["idc_collection_id"], "source_collection")
+            self.assertEqual(source_summary["idc_analysis_result_id"], "")
+            self.assertEqual(derived_summary["idc_subject_id"], "P1")
+            self.assertEqual(derived_summary["idc_collection_id"], "source_collection")
+            self.assertEqual(
+                derived_summary["idc_analysis_result_id"], "Derived-Result"
+            )
+
+            participant_rows = pd.DataFrame(
+                [
+                    {
+                        "patient_key": "source|p1",
+                        "dataset_type": "Collection",
+                        "short_title": "Source-Collection",
+                        "subject_id": "P1",
+                    },
+                    {
+                        "patient_key": "derived|p1",
+                        "dataset_type": "Analysis Result",
+                        "short_title": "Derived-Result",
+                        "subject_id": "P1",
+                    },
+                ]
+            )
+            participant_rows["subject_join_key"] = subject_join_keys(
+                participant_rows
+            )
+            participant_rows = participant_rows.merge(
+                search_summary,
+                on=["short_title", "subject_join_key"],
+                how="left",
+            )
+            grouped, memberships = build_grouped_patient_index(participant_rows)
+            self.assertEqual(len(grouped), 1)
+            self.assertEqual(len(memberships), 2)
+            self.assertEqual(int(grouped.iloc[0]["dataset_count"]), 2)
+
             paths = DataPaths(
                 snapshot_db=Path(directory) / "snapshot.sqlite",
                 clinical_db=Path(directory) / "clinical.sqlite",
@@ -762,6 +809,32 @@ class CohortBuilderDataTests(unittest.TestCase):
                 direct_collection_only=True,
             )
             self.assertEqual(set(source_detail["SeriesInstanceUID"]), {"ORIGINAL"})
+
+            all_detail = load_patient_idc_scope(
+                paths,
+                catalog,
+                memberships,
+                include_all_related=True,
+            )
+            self.assertEqual(
+                set(all_detail["SeriesInstanceUID"]), {"ORIGINAL", "DERIVED"}
+            )
+            collection_detail = load_patient_idc_scope(
+                paths,
+                catalog,
+                memberships[memberships["dataset_type"] == "Collection"],
+            )
+            self.assertEqual(
+                set(collection_detail["SeriesInstanceUID"]), {"ORIGINAL"}
+            )
+            analysis_detail = load_patient_idc_scope(
+                paths,
+                catalog,
+                memberships[memberships["dataset_type"] == "Analysis Result"],
+            )
+            self.assertEqual(
+                set(analysis_detail["SeriesInstanceUID"]), {"DERIVED"}
+            )
 
             route_patient = pd.DataFrame(
                 [
@@ -874,6 +947,35 @@ class CohortBuilderDataTests(unittest.TestCase):
         )
         self.assertIs(all_patients, patients)
         self.assertIs(all_memberships, memberships)
+
+    def test_visible_dataset_count_respects_explicit_dataset_selection(self):
+        patients = pd.DataFrame(
+            [{"patient_group_key": "grouped", "subject_id": "P1"}]
+        )
+        memberships = pd.DataFrame(
+            [
+                {"patient_group_key": "grouped", "short_title": "LIDC-IDRI"},
+                {
+                    "patient_group_key": "grouped",
+                    "short_title": "DICOM-LIDC-IDRI-Nodules",
+                },
+                {"patient_group_key": "grouped", "short_title": "Other-Result-A"},
+                {"patient_group_key": "grouped", "short_title": "Other-Result-B"},
+            ]
+        )
+
+        self.assertEqual(
+            count_visible_dataset_contexts(patients, memberships),
+            4,
+        )
+        self.assertEqual(
+            count_visible_dataset_contexts(
+                patients,
+                memberships,
+                ["LIDC-IDRI", "DICOM-LIDC-IDRI-Nodules"],
+            ),
+            2,
+        )
 
     def test_explicit_source_collection_groups_non_idc_analysis_result(self):
         patients = pd.DataFrame(

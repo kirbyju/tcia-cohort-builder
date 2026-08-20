@@ -3,10 +3,13 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from v2_artifacts import (
     BUNDLE_MANIFEST_ASSET,
     INSTALL_STATE_ASSET,
+    ensure_bundle_profile,
+    install_bundle_profile,
     installed_component,
     load_bundle_installation,
     require_installed_component,
@@ -58,6 +61,81 @@ def write_install(cache: Path, bundle: dict, installed_assets=None):
 
 
 class V2ArtifactCacheTests(unittest.TestCase):
+    @mock.patch("v2_artifacts.load_bundle_installation")
+    @mock.patch("v2_artifacts.installed_component")
+    @mock.patch("v2_artifacts.install_bundle_profile")
+    def test_complete_research_detail_skips_downloader(
+        self, install, installed, load_installation
+    ):
+        installed.return_value = object()
+        load_installation.return_value = mock.Mock(
+            directory=Path("/cache"),
+            release_tag="tcia-metadata-v2-latest",
+            release_fingerprint="current",
+        )
+
+        result = ensure_bundle_profile(Path("/skill"), Path("/cache"))
+
+        self.assertEqual(result["status"], "already_installed")
+        self.assertEqual(installed.call_count, 5)
+        install.assert_not_called()
+
+    @mock.patch("v2_artifacts.subprocess.run")
+    def test_research_detail_install_uses_official_bundle_installer(self, run):
+        run.return_value = mock.Mock(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "status": "unchanged",
+                    "profile": "research_detail",
+                    "release_tag": "tcia-metadata-v2-latest",
+                }
+            ),
+            stderr="",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installer = root / "skill" / "scripts" / "tcia_v2_bundle.py"
+            installer.parent.mkdir(parents=True)
+            installer.write_text("# test installer\n", encoding="utf-8")
+            cache = root / "cache"
+
+            result = install_bundle_profile(
+                root / "skill",
+                cache,
+                profile="research_detail",
+                python_executable="/test/python",
+            )
+
+            expected_cache = cache.resolve()
+
+        self.assertEqual(result["profile"], "research_detail")
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "/test/python")
+        self.assertEqual(
+            command[2:6],
+            ["install", "--tag", "tcia-metadata-v2-latest", "--profile"],
+        )
+        self.assertEqual(command[6], "research_detail")
+        self.assertEqual(command[7], "--install-dir")
+        self.assertEqual(Path(command[8]), expected_cache)
+
+    @mock.patch("v2_artifacts.subprocess.run")
+    def test_failed_startup_install_is_reported(self, run):
+        run.return_value = mock.Mock(
+            returncode=1,
+            stdout="",
+            stderr="network unavailable",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installer = root / "scripts" / "tcia_v2_bundle.py"
+            installer.parent.mkdir(parents=True)
+            installer.write_text("# test installer\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "network unavailable"):
+                install_bundle_profile(root, root / "cache")
+
     def test_official_install_receipt_exposes_component(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = Path(directory)

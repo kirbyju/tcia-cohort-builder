@@ -722,6 +722,9 @@ def load_idc_patient_search_summary(
     result_columns = [
         "short_title",
         "subject_join_key",
+        "idc_subject_id",
+        "idc_collection_id",
+        "idc_analysis_result_id",
         "dicom_series_idc",
         "dicom_modalities",
         "body_parts",
@@ -746,6 +749,8 @@ def load_idc_patient_search_summary(
         [
             "short_title",
             "subject_id",
+            "collection_id",
+            "idc_analysis_result_id",
             "SeriesInstanceUID",
             "Modality",
             "BodyPartExamined",
@@ -758,6 +763,9 @@ def load_idc_patient_search_summary(
     return (
         frame.groupby(["short_title", "subject_join_key"], sort=False)
         .agg(
+            idc_subject_id=("subject_id", "first"),
+            idc_collection_id=("collection_id", "first"),
+            idc_analysis_result_id=("idc_analysis_result_id", "first"),
             dicom_series_idc=("SeriesInstanceUID", "nunique"),
             dicom_modalities=("Modality", join_tokens),
             body_parts=("BodyPartExamined", join_tokens),
@@ -1187,8 +1195,8 @@ def build_patient_index(paths: DataPaths) -> pd.DataFrame:
 
     The compact Participant Inventory is the primary search/summary source.
     IDC contributes only participant-level DICOM BodyPartExamined filter values.
-    Clinical summaries are merged only after the user has explicitly installed
-    the research-detail clinical artifact.
+    Clinical summaries are merged from the research-detail artifact that the
+    Participant Explorer prepares during startup.
     """
     build_started = time.perf_counter()
     patients = _load_participant_search_index(paths.participant_db)
@@ -1589,6 +1597,29 @@ def filter_patient_groups_by_dataset_type(
     return scoped_patients, scoped_memberships
 
 
+def count_visible_dataset_contexts(
+    patients: pd.DataFrame,
+    memberships: pd.DataFrame,
+    selected_titles: Sequence[str] = (),
+) -> int:
+    """Count logical dataset contexts represented by the visible patients.
+
+    When users explicitly select datasets, the count describes those selected
+    contexts instead of also expanding related memberships attached to the same
+    grouped patient rows.
+    """
+    if patients.empty or memberships.empty:
+        return 0
+    visible_keys = set(patients["patient_group_key"].astype(str))
+    visible = memberships[
+        memberships["patient_group_key"].astype(str).isin(visible_keys)
+    ]
+    if selected_titles:
+        wanted = {str(value) for value in selected_titles}
+        visible = visible[visible["short_title"].astype(str).isin(wanted)]
+    return int(visible["short_title"].astype(str).nunique())
+
+
 def load_patient_clinical_facts(
     path: Path,
     short_title: str,
@@ -1696,6 +1727,87 @@ def load_patient_idc(
         (frame["short_title"] == short_title)
         & (frame_subject_keys == selected_key)
     ].copy()
+
+
+def load_patient_idc_scope(
+    paths: DataPaths,
+    catalog: pd.DataFrame,
+    members: pd.DataFrame,
+    *,
+    include_all_related: bool = False,
+) -> pd.DataFrame:
+    """Return IDC series for one explicit participant imaging scope.
+
+    IDC stores derived Analysis Result series inside the source collection.  A
+    Collection-only scope therefore removes rows with ``analysis_result_id``;
+    an Analysis Result scope selects its exact identifier; and an all-related
+    scope reads the physical collection once without duplicating derived rows.
+    """
+    if members.empty:
+        return pd.DataFrame()
+
+    ordered = members.sort_values(
+        ["dataset_type", "short_title"],
+        key=lambda series: series.astype(str).str.casefold(),
+        kind="stable",
+    )
+    selected_rows = ordered
+    if include_all_related:
+        collection_rows = ordered[ordered["dataset_type"] == "Collection"]
+        if not collection_rows.empty:
+            selected_rows = collection_rows
+
+    frames: list[pd.DataFrame] = []
+    seen_physical_scopes: set[tuple[str, str]] = set()
+
+    def first_present(*values: object) -> str:
+        for value in values:
+            if pd.notna(value) and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    for row in selected_rows.to_dict("records"):
+        dataset_type = str(row.get("dataset_type", ""))
+        short_title = str(row.get("short_title", ""))
+        subject_id = first_present(
+            row.get("idc_subject_id"), row.get("subject_id")
+        )
+        collection_id = first_present(row.get("idc_collection_id")) or None
+        analysis_result_id = first_present(
+            row.get("idc_analysis_result_id")
+        ) or None
+        if include_all_related and dataset_type == "Collection":
+            analysis_result_id = None
+            physical_scope = (
+                (collection_id or short_title).casefold(),
+                subject_id.casefold(),
+            )
+            if physical_scope in seen_physical_scopes:
+                continue
+            seen_physical_scopes.add(physical_scope)
+
+        frame = load_patient_idc(
+            paths,
+            catalog,
+            short_title,
+            subject_id,
+            collection_id=collection_id,
+            analysis_result_id=(
+                analysis_result_id if dataset_type == "Analysis Result" else None
+            ),
+            direct_collection_only=(
+                dataset_type == "Collection" and not include_all_related
+            ),
+        )
+        if not frame.empty:
+            frames.append(frame)
+
+    if not frames:
+        return pd.DataFrame()
+    result = pd.concat(frames, ignore_index=True, sort=False)
+    if "SeriesInstanceUID" in result:
+        result = result.drop_duplicates(subset=["SeriesInstanceUID"], keep="first")
+    return result.reset_index(drop=True)
 
 
 def load_patient_pathdb(

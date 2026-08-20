@@ -28,8 +28,8 @@ and supporting files, and preparing retrieval manifests.
 - Python 3.10 or newer;
 - the packages pinned in `requirements.txt`;
 - the current `idc_metadata.parquet` series index in this repository; and
-- an official local installation of the published
-  `tcia-metadata-v2-latest` release.
+- a local `tcia-query-skill` checkout from which the app can install the
+  published `tcia-metadata-v2-latest` release.
 
 Create an environment and install the application dependencies:
 
@@ -47,26 +47,13 @@ cd ../tcia-cohort-builder
 streamlit run tcia-cohort-builder.py
 ```
 
-Install the stable V2 research profile from the adjacent
-`tcia-query-skill` checkout before starting Streamlit:
+The app automatically installs the stable `research_detail` profile from the
+adjacent `tcia-query-skill` checkout during its first execution in each server
+process. That profile includes `research_core`, so one installer call prepares
+participant search plus clinical, controlled-access, and public non-DICOM
+detail. End users do not need to trigger downloads from the interface.
 
-```bash
-cd ../tcia-query-skill
-python3 scripts/tcia_v2_bundle.py install \
-  --tag tcia-metadata-v2-latest \
-  --profile research_core
-```
-
-The app reads the bundle manifest and official install receipt from
-`../tcia-query-skill/cache/tcia-metadata-v2-latest/`. It supports the stable V2
-`full` and `streamlined` contracts (bundle schema 2), Participant Inventory
-schema 6, and Snapshot schema 7. Unsupported or incomplete installations fail
-with an explicit install command. Downloads, hashing, SQLite integrity checks,
-and atomic replacement remain the responsibility of the official bundle
-installer instead of running during a Streamlit rerun.
-
-Public non-DICOM, controlled-access, and full clinical details are in the
-optional `research_detail` profile. Install them outside the app when needed:
+To prepare the same installation before starting Streamlit manually, run:
 
 ```bash
 cd ../tcia-query-skill
@@ -74,6 +61,15 @@ python3 scripts/tcia_v2_bundle.py install \
   --tag tcia-metadata-v2-latest \
   --profile research_detail
 ```
+
+The app reads the bundle manifest and official install receipt from
+`../tcia-query-skill/cache/tcia-metadata-v2-latest/`. It supports the stable V2
+`full` and `streamlined` contracts (bundle schema 2), Participant Inventory
+schema 6, and Snapshot schema 7. Unsupported or incomplete installations fail
+with an explicit operator error. Downloads, hashing, SQLite integrity checks,
+and atomic replacement remain the responsibility of the official query-skill
+bundle installer. The startup call is cached once per Streamlit server process
+rather than repeated on widget reruns or for each browser session.
 
 The consumer requires public non-DICOM schema 7, controlled-access schema 2,
 and clinical schema 17. It does not read preview caches or
@@ -90,7 +86,8 @@ app.
 
 Set `TCIA_V2_INSTALL_DIR` to share one official bundle installation with the
 MCP and REST services. `TCIA_METADATA_V2_CACHE` is the Streamlit-specific
-override when it needs a different installation. Set
+override when it needs a different installation. Set `TCIA_QUERY_SKILL_ROOT`
+when the query-skill checkout is not adjacent to this repository. Set
 `TCIA_METADATA_V2_RELEASE_TAG` to test a different compatible stable tag, and
 `TCIA_IDC_METADATA_PARQUET` to override the local IDC detail index.
 

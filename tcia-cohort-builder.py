@@ -6,6 +6,7 @@ import hashlib
 import html
 import json
 import logging
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -18,10 +19,12 @@ from cohort_builder_data import (
     DataPaths,
     add_idc_viewer_urls,
     build_filtered_cohort_download,
+    build_grouped_patient_index,
     build_manifest_download,
     build_patient_index,
     cart_item,
     collect_filtered_imaging_routes,
+    count_visible_dataset_contexts,
     deduplicate_cart,
     filter_patient_groups_by_dataset_type,
     load_dataset_catalog,
@@ -30,7 +33,7 @@ from cohort_builder_data import (
     load_patient_clinical_facts,
     load_patient_clinical_longitudinal,
     load_patient_controlled,
-    load_patient_idc,
+    load_patient_idc_scope,
     load_patient_public_non_dicom,
     load_participant_assets,
     load_participant_identity_evidence,
@@ -46,13 +49,14 @@ from cohort_builder_data import (
 from v2_artifacts import (
     INSTALL_STATE_ASSET,
     V2_RELEASE_TAG,
+    ensure_bundle_profile,
     installed_component,
     load_bundle_installation,
     require_installed_component,
 )
 
 
-PATIENT_INDEX_SCHEMA_VERSION = 11
+PATIENT_INDEX_SCHEMA_VERSION = 12
 APP_DIR = Path(__file__).resolve().parent
 BRAND_SKILL_DIR = Path.home() / ".codex" / "skills" / "tcia-brand-guidelines"
 LOGO_PATH = BRAND_SKILL_DIR / "assets" / "tcia-logo-dark.svg"
@@ -168,9 +172,7 @@ def cached_patient_views(
     paths: DataPaths, signatures: tuple
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     patients = build_patient_index(paths)
-    patients["patient_group_key"] = patients["patient_key"]
-    members = patients.copy()
-    return patients, members
+    return build_grouped_patient_index(patients)
 
 
 @st.cache_data(show_spinner=False)
@@ -178,12 +180,22 @@ def cached_catalog(paths: DataPaths, signatures: tuple) -> pd.DataFrame:
     return load_dataset_catalog(paths.snapshot_db)
 
 
-@st.cache_resource(show_spinner="Checking the installed V2 metadata release…")
-def prepare_v2_core(cache_dir: str) -> tuple[str, str, int, str, str, str, str]:
+@st.cache_resource(show_spinner="Preparing clinical and non-DICOM metadata…")
+def prepare_v2_release(
+    skill_root: str, cache_dir: str
+) -> tuple[str, str, int, str, str, str, str]:
     directory = Path(cache_dir)
+    ensure_bundle_profile(
+        Path(skill_root),
+        directory,
+        profile="research_detail",
+    )
     installation = load_bundle_installation(directory)
     participant = require_installed_component(directory, "participant_inventory")
     snapshot = require_installed_component(directory, "snapshot")
+    require_installed_component(directory, "public_non_dicom")
+    require_installed_component(directory, "controlled_access")
+    require_installed_component(directory, "clinical")
     return (
         participant.release_fingerprint,
         snapshot.release_fingerprint,
@@ -196,14 +208,10 @@ def prepare_v2_core(cache_dir: str) -> tuple[str, str, int, str, str, str, str]:
 
 
 def render_detail_install_notice(message: str) -> None:
-    st.info(
+    st.warning(
         message
-        + " Install the stable research-detail profile from the tcia-query-skill "
-        "checkout, then refresh this app."
-    )
-    st.code(
-        "python3 scripts/tcia_v2_bundle.py install --profile research_detail",
-        language="bash",
+        + " The app normally installs research detail during startup. Ask the "
+        "service operator to check the startup log and restart the app."
     )
 
 
@@ -415,13 +423,6 @@ def member_short_titles(patient: pd.Series) -> list[str]:
     return member_json_values(
         patient, "member_short_titles_json", patient.get("short_title", "")
     )
-
-
-def dataset_membership_count(frame: pd.DataFrame) -> int:
-    titles: set[str] = set()
-    for _, row in frame.iterrows():
-        titles.update(member_short_titles(row))
-    return len(titles)
 
 
 def render_filtered_cohort_export(
@@ -647,7 +648,7 @@ def render_aspera_packages(paths: DataPaths, short_title: str, patient_key: str)
     packages = load_dataset_aspera_packages(paths.snapshot_db, short_title)
     if packages.empty:
         return
-    st.markdown("**Dataset package**")
+    st.markdown(f"**Dataset package · {short_title}**")
     st.caption(
         "Aspera opens the complete TCIA dataset package, not a patient-only download."
     )
@@ -673,17 +674,45 @@ def render_aspera_packages(paths: DataPaths, short_title: str, patient_key: str)
 def render_imaging(
     paths: DataPaths,
     catalog: pd.DataFrame,
-    patient: pd.Series,
+    members: pd.DataFrame,
     *,
-    direct_collection_only: bool = False,
+    include_all_related: bool = False,
 ) -> None:
-    short_title = str(patient["short_title"])
-    subject_id = str(patient["subject_id"])
-    access = str(patient.get("resolved_access_level", "unknown"))
-    dicom_count = safe_int(patient.get("dicom_series"))
-    aspera_dicom_count = safe_int(patient.get("public_dicom_files_outside_idc"))
-    public_non_dicom_count = safe_int(patient.get("public_non_dicom_files"))
-    controlled_count = safe_int(patient.get("controlled_files"))
+    if members.empty:
+        st.info("No dataset-scoped imaging context is available for this patient.")
+        return
+    primary = members.iloc[0]
+    short_title = str(primary["short_title"])
+    subject_id = str(primary["subject_id"])
+    patient_key = str(primary["patient_key"])
+    access_values = {
+        str(value)
+        for value in members.get(
+            "resolved_access_level", pd.Series(dtype=str)
+        ).dropna()
+        if str(value).strip()
+    }
+    access = next(iter(access_values)) if len(access_values) == 1 else "mixed"
+    dicom = load_patient_idc_scope(
+        paths,
+        catalog,
+        members,
+        include_all_related=include_all_related,
+    )
+    dicom_count = (
+        int(dicom["SeriesInstanceUID"].nunique())
+        if not dicom.empty and "SeriesInstanceUID" in dicom
+        else 0
+    )
+
+    def scope_count(column: str) -> int:
+        if column not in members:
+            return 0
+        return int(pd.to_numeric(members[column], errors="coerce").fillna(0).sum())
+
+    aspera_dicom_count = scope_count("public_dicom_files_outside_idc")
+    public_non_dicom_count = scope_count("public_non_dicom_files")
+    controlled_count = scope_count("controlled_files")
 
     source_tabs = st.tabs(
         [
@@ -691,18 +720,11 @@ def render_imaging(
             f"Public non-DICOM {public_non_dicom_count:,}",
             f"Controlled access {controlled_count:,}",
         ],
-        key=f"imaging_sources_{patient['patient_key']}_{short_title}",
+        key=f"imaging_sources_{patient_key}_{short_title}_{'all' if include_all_related else 'one'}",
         on_change="rerun",
     )
     if source_tabs[0].open:
       with source_tabs[0]:
-        dicom = load_patient_idc(
-            paths,
-            catalog,
-            short_title,
-            subject_id,
-            direct_collection_only=direct_collection_only,
-        )
         st.caption(
             f"IDC series: {dicom_count:,} · "
             f"Public DICOM files outside IDC: {aspera_dicom_count:,}"
@@ -738,14 +760,14 @@ def render_imaging(
                     "viewer_url": st.column_config.LinkColumn("Viewer", display_text="Open viewer"),
                 },
             )
-            if st.button("Add all public DICOM series", key=f"draft_add_dicom_{patient['patient_key']}"):
+            if st.button("Add all public DICOM series", key=f"draft_add_dicom_{patient_key}_{'all' if include_all_related else short_title}"):
                 finish_cart_add(
                     add_cart_items(
                         [
                             cart_item(
                                 "dicom",
                                 row["SeriesInstanceUID"],
-                                short_title=short_title,
+                                short_title=str(row.get("short_title", short_title)),
                                 subject_id=subject_id,
                                 label=f"{row.get('Modality', 'DICOM')} · {row.get('SeriesDescription', '')}",
                                 source="IDC",
@@ -756,24 +778,39 @@ def render_imaging(
                     )
                 )
         if aspera_dicom_count:
-            render_aspera_packages(
-                paths, short_title, f"{patient['patient_key']}_dicom"
-            )
+            for member in members.itertuples(index=False):
+                if safe_int(getattr(member, "public_dicom_files_outside_idc", 0)):
+                    render_aspera_packages(
+                        paths,
+                        str(member.short_title),
+                        f"{patient_key}_dicom_{member.short_title}",
+                    )
             if paths.public_non_dicom_db is None or not paths.public_non_dicom_db.exists():
                 render_detail_install_notice(
                     "Participant-linked Aspera DICOM representation detail is not installed."
                 )
             else:
-                aspera_dicom = load_patient_public_non_dicom(
-                    paths.public_non_dicom_db,
-                    short_title,
-                    subject_id,
-                    include_dicom=True,
+                aspera_frames = []
+                for member in members.itertuples(index=False):
+                    frame = load_patient_public_non_dicom(
+                        paths.public_non_dicom_db,
+                        str(member.short_title),
+                        str(member.subject_id),
+                        include_dicom=True,
+                    )
+                    if not frame.empty:
+                        frame = frame.copy()
+                        frame["dataset_context"] = str(member.short_title)
+                        aspera_frames.append(frame)
+                aspera_dicom = (
+                    pd.concat(aspera_frames, ignore_index=True, sort=False)
+                    if aspera_frames
+                    else pd.DataFrame()
                 )
                 if not aspera_dicom.empty:
                     columns = [
                         column for column in (
-                            "file_format", "modality", "object_role",
+                            "dataset_context", "file_format", "modality", "object_role",
                             "represented_file_count", "representation_provenance_class",
                             "participant_link_status",
                         ) if column in aspera_dicom
@@ -785,12 +822,32 @@ def render_imaging(
 
     if source_tabs[1].open:
       with source_tabs[1]:
-        render_aspera_packages(
-            paths, short_title, f"{patient['patient_key']}_non_dicom"
+        for member in members.itertuples(index=False):
+            render_aspera_packages(
+                paths,
+                str(member.short_title),
+                f"{patient_key}_non_dicom_{member.short_title}",
+            )
+        public_frames = []
+        for member in members.itertuples(index=False):
+            frame = load_patient_public_non_dicom(
+                paths.public_non_dicom_db,
+                str(member.short_title),
+                str(member.subject_id),
+            )
+            if not frame.empty:
+                frame = frame.copy()
+                frame["dataset_context"] = str(member.short_title)
+                public_frames.append(frame)
+        public_detail = (
+            pd.concat(public_frames, ignore_index=True, sort=False)
+            if public_frames
+            else pd.DataFrame()
         )
-        public_detail = load_patient_public_non_dicom(
-            paths.public_non_dicom_db, short_title, subject_id
-        )
+        if not public_detail.empty and "asset_id" in public_detail:
+            public_detail = public_detail.drop_duplicates(
+                subset=["dataset_context", "asset_id"], keep="first"
+            )
         if paths.public_non_dicom_db is None or not paths.public_non_dicom_db.exists():
             render_detail_install_notice(
                 "Public non-DICOM file detail is not installed."
@@ -812,7 +869,7 @@ def render_imaging(
             columns = populated_columns(
                 public_detail,
                 (
-                    "file_name", "asset_name", "file_format", "media_kind", "modality",
+                    "dataset_context", "file_name", "asset_name", "file_format", "media_kind", "modality",
                     "body_part_examined", "study_datetime", "sequence_class",
                     "sequence_tags", "sequences_present", "acquisition_dimensionality",
                     "scanner_site", "manufacturer", "manufacturer_model_name",
@@ -874,18 +931,40 @@ def render_imaging(
                                 ),
                             },
                         )
-            coverage = load_public_non_dicom_metadata_coverage(
-                paths.public_non_dicom_db, short_title
+            coverage_frames = []
+            note_frames = []
+            for member in members.itertuples(index=False):
+                member_title = str(member.short_title)
+                member_coverage = load_public_non_dicom_metadata_coverage(
+                    paths.public_non_dicom_db, member_title
+                )
+                member_notes = load_public_non_dicom_metadata_notes(
+                    paths.public_non_dicom_db, member_title
+                )
+                if not member_coverage.empty:
+                    member_coverage = member_coverage.copy()
+                    member_coverage["dataset_context"] = member_title
+                    coverage_frames.append(member_coverage)
+                if not member_notes.empty:
+                    member_notes = member_notes.copy()
+                    member_notes["dataset_context"] = member_title
+                    note_frames.append(member_notes)
+            coverage = (
+                pd.concat(coverage_frames, ignore_index=True, sort=False)
+                if coverage_frames
+                else pd.DataFrame()
             )
-            notes = load_public_non_dicom_metadata_notes(
-                paths.public_non_dicom_db, short_title
+            notes = (
+                pd.concat(note_frames, ignore_index=True, sort=False)
+                if note_frames
+                else pd.DataFrame()
             )
             if not coverage.empty or not notes.empty:
                 with st.expander("Metadata coverage and review notes", expanded=False):
                     if not coverage.empty:
                         coverage_columns = [
                             column for column in (
-                                "field_name", "eligible_assets", "populated_assets",
+                                "dataset_context", "field_name", "eligible_assets", "populated_assets",
                                 "source_raw_assets", "normalized_assets", "inferred_assets",
                                 "distinct_value_count", "example_values_json",
                             ) if column in coverage
@@ -896,7 +975,7 @@ def render_imaging(
                     if not notes.empty:
                         note_columns = [
                             column for column in (
-                                "field_name", "note_code", "severity", "status",
+                                "dataset_context", "field_name", "note_code", "severity", "status",
                                 "affected_assets", "description",
                             ) if column in notes
                         ]
@@ -908,7 +987,22 @@ def render_imaging(
 
     if source_tabs[2].open:
       with source_tabs[2]:
-        controlled = load_patient_controlled(paths.controlled_db, short_title, subject_id)
+        controlled_frames = []
+        for member in members.itertuples(index=False):
+            frame = load_patient_controlled(
+                paths.controlled_db,
+                str(member.short_title),
+                str(member.subject_id),
+            )
+            if not frame.empty:
+                frame = frame.copy()
+                frame["dataset_context"] = str(member.short_title)
+                controlled_frames.append(frame)
+        controlled = (
+            pd.concat(controlled_frames, ignore_index=True, sort=False)
+            if controlled_frames
+            else pd.DataFrame()
+        )
         if not paths.controlled_db.exists():
             render_detail_install_notice(
                 "Controlled-access metadata are not installed; controlled payloads remain restricted."
@@ -923,17 +1017,17 @@ def render_imaging(
                 f'<div class="access-callout"><strong>Controlled metadata only.</strong> Authorization is required before retrieval. Review the <a href="{POLICY_URL}">TCIA policy</a>.</div>',
                 unsafe_allow_html=True,
             )
-            columns = [column for column in ("route_system", "modality", "study_date", "series_description", "file_name", "drs_uri") if column in controlled]
+            columns = [column for column in ("dataset_context", "route_system", "modality", "study_date", "series_description", "file_name", "drs_uri") if column in controlled]
             st.dataframe(controlled[columns], hide_index=True, width="stretch")
             routed = controlled[controlled["drs_uri"].fillna("").astype(str).str.strip() != ""]
-            if st.button("Add authorized DRS routes", disabled=routed.empty, key=f"draft_add_drs_{patient['patient_key']}"):
+            if st.button("Add authorized DRS routes", disabled=routed.empty, key=f"draft_add_drs_{patient_key}_{'all' if include_all_related else short_title}"):
                 finish_cart_add(
                     add_cart_items(
                         [
                             cart_item(
                                 "drs",
                                 row.get("drs_uri"),
-                                short_title=short_title,
+                                short_title=str(row.get("dataset_context", short_title)),
                                 subject_id=subject_id,
                                 label=f"Controlled · {row.get('file_name', '')}",
                                 source=str(row.get("route_system", "controlled")),
@@ -1160,21 +1254,51 @@ def render_patient_detail(
                 lambda value: 0 if value == "Collection" else 1
             )
         ).sort_values(["_type_rank", "short_title"], kind="stable")
-        member_options = {
-            f"{row.get('dataset_type', 'Dataset')} · {row['short_title']}": index
-            for index, row in ordered_members.iterrows()
-        }
-        selected_context = st.selectbox(
-            "Dataset context",
-            list(member_options),
-            key=f"imaging_context_{patient['patient_key']}",
+        ordered_members = ordered_members.reset_index(drop=True)
+        scope_options = ["All data for this patient"]
+        scope_options.extend(
+            (
+                f"Collection only · {row['short_title']}"
+                if row.get("dataset_type") == "Collection"
+                else f"Analysis Result only · {row['short_title']}"
+            )
+            for _, row in ordered_members.iterrows()
         )
-        selected_member = ordered_members.loc[member_options[selected_context]]
+        selected_scope = st.selectbox(
+            "Imaging scope",
+            scope_options,
+            key=f"imaging_context_{patient['patient_key']}",
+            help=(
+                "IDC physically stores derived Analysis Result series inside the "
+                "source collection. This control applies TCIA's logical dataset scope."
+            ),
+        )
+        if selected_scope == scope_options[0]:
+            scope_members = ordered_members
+            include_all_related = True
+            st.caption(
+                "Showing the source Collection together with all related Analysis "
+                "Result data linked to this patient."
+            )
+        else:
+            scope_members = ordered_members.iloc[[scope_options.index(selected_scope) - 1]]
+            include_all_related = False
+            selected_type = str(scope_members.iloc[0].get("dataset_type", "Dataset"))
+            if selected_type == "Collection":
+                st.caption(
+                    "Showing original Collection data only; series assigned to an "
+                    "Analysis Result are excluded even though IDC stores them in the same collection."
+                )
+            else:
+                st.caption(
+                    "Showing only data assigned to this Analysis Result; original "
+                    "Collection data are excluded."
+                )
         render_imaging(
             paths,
             catalog,
-            selected_member,
-            direct_collection_only=False,
+            scope_members,
+            include_all_related=include_all_related,
         )
 
 
@@ -1185,6 +1309,12 @@ def main() -> None:
         st.stop()
     try:
         v2_cache = paths.participant_db.parent
+        configured_skill_root = os.environ.get("TCIA_QUERY_SKILL_ROOT")
+        skill_root = (
+            Path(configured_skill_root).expanduser()
+            if configured_skill_root
+            else APP_DIR.parent / "tcia-query-skill"
+        ).resolve()
         (
             participant_fingerprint,
             snapshot_fingerprint,
@@ -1193,15 +1323,15 @@ def main() -> None:
             release_contract,
             bundle_fingerprint,
             generated_at_utc,
-        ) = prepare_v2_core(str(v2_cache))
+        ) = prepare_v2_release(str(skill_root), str(v2_cache))
     except Exception as exc:
         st.error(
-            "The stable V2 bundle is not installed or its local receipt does not "
-            "match the bundle manifest. Install the research-core profile from the "
-            "tcia-query-skill checkout, then refresh."
+            "The app could not automatically prepare the stable V2 research-detail "
+            "bundle. Check network access, shared-cache permissions, and "
+            "TCIA_QUERY_SKILL_ROOT, then restart the app."
         )
         st.code(
-            "python3 scripts/tcia_v2_bundle.py install --profile research_core",
+            "python3 scripts/tcia_v2_bundle.py install --profile research_detail",
             language="bash",
         )
         st.exception(exc)
@@ -1338,7 +1468,7 @@ def main() -> None:
         working = apply_token_filter(working, "body_parts", body_parts)
         clinical_values: dict[str, list[str]] = {}
         if not paths.clinical_db.exists():
-            a3.caption("Clinical facts are an optional research-detail component.")
+            a3.caption("Startup preparation did not provide clinical detail.")
             render_detail_install_notice(
                 "Clinical detail is required for diagnosis, site, sex-at-birth, and "
                 "vital-status filters. Participant search remains available from the core inventory."
@@ -1367,7 +1497,7 @@ def main() -> None:
     reset_col.button("Clear filters", on_click=clear_filters, width="stretch")
     count_col.markdown(
         f"**{len(working):,} matching patients** across "
-        f"**{dataset_membership_count(working) if not working.empty else 0:,} datasets**"
+        f"**{count_visible_dataset_contexts(working, scoped_memberships, datasets):,} datasets**"
     )
 
     render_filter_chips(
