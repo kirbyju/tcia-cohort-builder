@@ -1,14 +1,17 @@
 import csv
 import io
+import json
 import sqlite3
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 from cohort_builder_data import (
     DataPaths,
     aggregate_idc,
+    build_patient_index,
     build_filtered_cohort_download,
     build_grouped_patient_index,
     build_manifest_download,
@@ -18,14 +21,24 @@ from cohort_builder_data import (
     collapse_clinical_subject_aliases,
     collect_filtered_imaging_routes,
     deduplicate_cart,
+    enrich_participants_with_clinical_detail,
     exclude_nlst_clinical_only,
+    filter_patient_groups_by_dataset_type,
     idc_viewer_url,
     load_clinical_subjects,
     load_idc_series,
+    load_idc_patient_search_summary,
+    load_dataset_aspera_packages,
     load_patient_idc,
+    load_patient_clinical_longitudinal,
     load_patient_nifti_packages,
+    load_patient_public_non_dicom,
+    load_public_non_dicom_image_metadata,
+    load_public_non_dicom_locations,
     normalize_dataset_key,
     normalize_subject_key,
+    participant_availability_rows,
+    resolve_data_paths,
     subject_join_key,
     subject_join_keys,
 )
@@ -33,6 +46,443 @@ import pandas as pd
 
 
 class CohortBuilderDataTests(unittest.TestCase):
+    def test_shared_v2_install_dir_is_used_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            install_dir = Path(directory) / "v2"
+            with mock.patch.dict(
+                "os.environ",
+                {"TCIA_V2_INSTALL_DIR": str(install_dir)},
+                clear=True,
+            ):
+                paths = resolve_data_paths(
+                    app_dir=Path(directory) / "app",
+                    skill_root=Path(directory) / "skill",
+                )
+
+            self.assertEqual(
+                paths.participant_db,
+                (install_dir / "participant_inventory.sqlite").resolve(),
+            )
+            self.assertEqual(
+                paths.bundle_manifest,
+                (install_dir / "tcia_metadata_v2_bundle_manifest.json").resolve(),
+            )
+
+    def test_clinical_detail_enrichment_is_opt_in_and_case_equivalent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clinical_db = Path(directory) / "clinical.sqlite"
+            with sqlite3.connect(clinical_db) as connection:
+                connection.execute(
+                    "CREATE TABLE agent_clinical_all_subjects ("
+                    "short_title TEXT, subject_id TEXT, primary_diagnosis TEXT, "
+                    "has_imaging INTEGER, source_count INTEGER, conflict_count INTEGER, "
+                    "source_kinds TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO agent_clinical_all_subjects VALUES (?,?,?,?,?,?,?)",
+                    ("TEST", "p-01", "Resolved diagnosis", 1, 1, 0, '[\"clinical\"]'),
+                )
+            participants = pd.DataFrame(
+                [{"short_title": "TEST", "subject_id": "P-01"}]
+            )
+
+            missing = enrich_participants_with_clinical_detail(
+                participants, Path(directory) / "missing.sqlite"
+            )
+            self.assertTrue(pd.isna(missing.iloc[0]["primary_diagnosis"]))
+
+            enriched = enrich_participants_with_clinical_detail(
+                participants, clinical_db
+            )
+            self.assertEqual(
+                enriched.iloc[0]["primary_diagnosis"], "Resolved diagnosis"
+            )
+
+    def test_idc_search_summary_is_aggregated_by_dataset_scoped_participant(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "idc.parquet"
+            pd.DataFrame(
+                [
+                    {
+                        "collection_id": "test_collection",
+                        "analysis_result_id": "",
+                        "PatientID": "P1",
+                        "SeriesInstanceUID": "1",
+                        "Modality": "CT",
+                        "BodyPartExamined": "CHEST",
+                    },
+                    {
+                        "collection_id": "test_collection",
+                        "analysis_result_id": "",
+                        "PatientID": "P1",
+                        "SeriesInstanceUID": "2",
+                        "Modality": "SEG",
+                        "BodyPartExamined": "ABDOMEN",
+                    },
+                    {
+                        "collection_id": "test_collection",
+                        "analysis_result_id": "",
+                        "PatientID": "P2",
+                        "SeriesInstanceUID": "3",
+                        "Modality": "MR",
+                        "BodyPartExamined": None,
+                    },
+                ]
+            ).to_parquet(path, index=False)
+            catalog = pd.DataFrame(
+                [{"short_title": "TEST", "dataset_key": "testcollection"}]
+            )
+
+            result = load_idc_patient_search_summary(path, catalog)
+
+            self.assertEqual(len(result), 2)
+            p1 = result[result["subject_join_key"] == "p1"].iloc[0]
+            self.assertEqual(p1["short_title"], "TEST")
+            self.assertEqual(int(p1["dicom_series_idc"]), 2)
+            self.assertEqual(p1["dicom_modalities"], "CT; SEG")
+            self.assertEqual(p1["body_parts"], "ABDOMEN; CHEST")
+
+    def test_dataset_aspera_packages_are_public_wordpress_routes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "snapshot.sqlite"
+            with sqlite3.connect(path) as connection:
+                connection.execute(
+                    "CREATE TABLE agent_current_downloads (short_title TEXT, hidden INTEGER, "
+                    "download_id TEXT, download_title TEXT, download_url TEXT, download_size TEXT, "
+                    "download_size_unit TEXT, license_label TEXT, access_level TEXT, controlled_access INTEGER)"
+                )
+                connection.executemany(
+                    "INSERT INTO agent_current_downloads VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    [
+                        ("Pedi-Cranial-CT-Healthy", 0, "1", "Images", "https://faspex.cancerimagingarchive.net/?context=public-package", "3.2", "gb", "CC BY 4.0", "open", 0),
+                        ("Pedi-Cranial-CT-Healthy", 0, "2", "Controlled", "https://faspex.cancerimagingarchive.net/?context=controlled-package", "1", "gb", "Restricted", "controlled", 1),
+                        ("Pedi-Cranial-CT-Healthy", 0, "3", "Untrusted", "https://example.org/?context=other", "1", "gb", "CC BY 4.0", "open", 0),
+                    ],
+                )
+
+            packages = load_dataset_aspera_packages(
+                path, "Pedi-Cranial-CT-Healthy"
+            )
+
+            self.assertEqual(packages["download_id"].tolist(), ["1"])
+
+    def test_filtered_mha_export_does_not_require_controlled_drs_column(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            public_db = root / "public.sqlite"
+            with sqlite3.connect(public_db) as connection:
+                connection.execute(
+                    "CREATE TABLE agent_public_non_dicom_asset_participants ("
+                    "short_title TEXT, subject_id TEXT, file_name TEXT, package_path TEXT, "
+                    "asset_id TEXT, file_format TEXT, media_kind TEXT, "
+                    "imaging_domain TEXT, modality TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO agent_public_non_dicom_asset_participants "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        "Pedi-Cranial-CT-Healthy", "107", "00107_CT.mha",
+                        "package/00107_CT.mha", "asset1", "MHA", "image",
+                        "radiology", "CT",
+                    ),
+                )
+            missing = root / "missing.sqlite"
+            paths = DataPaths(
+                missing, missing, missing, missing, missing, missing,
+                public_non_dicom_db=public_db,
+            )
+            patients = pd.DataFrame(
+                [{"short_title": "Pedi-Cranial-CT-Healthy", "subject_id": "107"}]
+            )
+
+            routes, unrouted = collect_filtered_imaging_routes(
+                paths,
+                pd.DataFrame(),
+                patients,
+                imaging_sources=["MHA volumes", "Controlled access"],
+            )
+
+            self.assertEqual(routes, {})
+            self.assertEqual(len(unrouted), 1)
+            self.assertEqual(unrouted.iloc[0]["source"], "Public non-DICOM")
+            self.assertIn("dataset-level package", unrouted.iloc[0]["reason"])
+
+    def test_participant_availability_distinguishes_unlinked_from_absent(self):
+        rows = participant_availability_rows(
+            {
+                "has_public_dicom": True,
+                "has_public_non_dicom": False,
+                "has_clinical": True,
+                "has_controlled_metadata": False,
+                "dataset_unlinked_asset_groups": 2,
+            }
+        )
+        by_data = {row["Data"]: row["Coverage"] for row in rows}
+        self.assertEqual(by_data["Public DICOM"], "Participant linked")
+        self.assertEqual(
+            by_data["Public non-DICOM"],
+            "Dataset-level only; participant crosswalk unavailable",
+        )
+        self.assertNotIn("absent", by_data["Public non-DICOM"].casefold())
+
+    def test_v2_participant_inventory_is_primary_search_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            participant_db = root / "participant.sqlite"
+            with sqlite3.connect(participant_db) as connection:
+                connection.execute(
+                    "CREATE TABLE participants (participant_key TEXT, dataset_type TEXT, "
+                    "short_title TEXT, display_participant_id TEXT, identity_scope TEXT, "
+                    "within_dataset_identity_status TEXT, identity_resolution_method TEXT, "
+                    "cross_dataset_identity_status TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO participants VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        "pk1", "Collection", "TEST", "P1", "dataset_scoped",
+                        "resolved", "casefolded_identifier_same_tcia_dataset",
+                        "not_asserted",
+                    ),
+                )
+                connection.execute(
+                    "CREATE VIEW agent_participant_search AS SELECT *, 2 AS source_namespace_count, "
+                    "'tcia_dataset:TEST,crdc_idc:TEST' AS source_namespaces, 1 AS inventory_rows, "
+                    "1 AS has_open_data, 1 AS has_controlled_data, 1 AS has_public_dicom, "
+                    "1 AS has_public_non_dicom, 1 AS has_clinical, 'radiology,clinical' AS data_domains, "
+                    "'CT' AS modalities, 'DICOM,MHA' AS file_formats, "
+                    "'crdc_idc,tcia_wordpress' AS managed_systems FROM participants"
+                )
+                connection.execute(
+                    "CREATE TABLE agent_participant_assets (participant_asset_id TEXT, participant_key TEXT, "
+                    "managed_system TEXT, source_artifact TEXT, access_level TEXT, data_domain TEXT, "
+                    "media_kind TEXT, modality TEXT, file_format TEXT, object_role TEXT, study_count INTEGER, "
+                    "series_count INTEGER, file_count INTEGER, known_size_bytes INTEGER, "
+                    "has_file_level_metadata INTEGER, detail_pointer TEXT, access_route TEXT, "
+                    "inventory_status TEXT, source_version TEXT, provenance_json TEXT)"
+                )
+                connection.executemany(
+                    "INSERT INTO agent_participant_assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [
+                        ("a1", "pk1", "crdc_idc", "idc", "open", "radiology", "image_series", "CT", "DICOM", "source_image", 1, 2, 20, 100, 1, "idc", "view", "known", "v1", "{}"),
+                        ("a2", "pk1", "tcia_wordpress", "public_non_dicom_metadata", "open", "radiology", "image_volume", "CT", "MHA", "standardized_image", 1, 0, 1, 50, 1, "pnd", "download", "known", "v3", "{}"),
+                        ("a3", "pk1", "crdc_gc", "controlled_access_metadata", "controlled", "radiology", "image_series", "CT", "DICOM", "submitted_original", 1, 1, 5, 80, 1, "controlled", "request", "known", "v2", "{}"),
+                        ("a4", "pk1", "tcia_aspera", "public_non_dicom_metadata", "open", "radiology", "participant_modality", "MR", "DICOM", "submitted_original", 0, 0, 400, 0, 0, "pnd", "download", "known", "v6", "{}"),
+                    ],
+                )
+                connection.execute(
+                    "CREATE TABLE agent_participant_clinical_values (participant_clinical_value_id TEXT, "
+                    "participant_key TEXT, concept TEXT, raw_field_name TEXT, raw_value TEXT, standardized_value TEXT, "
+                    "value_role TEXT, normalization_method TEXT, managed_system TEXT, source_artifact TEXT, "
+                    "source_url TEXT, confidence TEXT, review_status TEXT, provenance_json TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO agent_participant_clinical_values VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ("c1", "pk1", "primary_diagnosis", "diagnosis", "raw dx", "Resolved diagnosis", "resolved", "review", "tcia_wordpress", "clinical_metadata", "https://example.org", "source_supported", "accepted", "{}"),
+                )
+                connection.execute(
+                    "CREATE TABLE agent_dataset_assets_without_participant_crosswalk (short_title TEXT)"
+                )
+                connection.execute("INSERT INTO agent_dataset_assets_without_participant_crosswalk VALUES ('TEST')")
+                connection.execute(
+                    "CREATE TABLE agent_participant_link_issues (short_title TEXT, raw_identifier TEXT)"
+                )
+
+            empty = root / "missing.sqlite"
+            paths = DataPaths(empty, empty, empty, empty, empty, empty, participant_db=participant_db)
+            result = build_patient_index(paths)
+
+            self.assertEqual(len(result), 1)
+            row = result.iloc[0]
+            self.assertEqual(row["patient_key"], "pk1")
+            self.assertEqual(int(row["ct_series"]), 2)
+            self.assertEqual(int(row["dicom_series"]), 2)
+            self.assertEqual(int(row["public_dicom_files_outside_idc"]), 400)
+            self.assertEqual(int(row["public_non_dicom_files"]), 1)
+            self.assertEqual(int(row["controlled_files"]), 5)
+            self.assertEqual(int(row["mha_volumes"]), 1)
+            self.assertEqual(row["resolved_access_level"], "mixed")
+            self.assertTrue(pd.isna(row["primary_diagnosis"]))
+            self.assertEqual(
+                row["identity_resolution_method"],
+                "casefolded_identifier_same_tcia_dataset",
+            )
+            self.assertEqual(row["imaging_linkage_status"], "Partial coverage or linkage review")
+
+    def test_public_non_dicom_locations_do_not_multiply_logical_assets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "public.sqlite"
+            with sqlite3.connect(path) as connection:
+                connection.execute(
+                    "CREATE TABLE public_non_dicom_assets (asset_id TEXT, dataset_type TEXT, short_title TEXT, "
+                    "asset_name TEXT, file_name TEXT, package_path TEXT, file_format TEXT, media_kind TEXT, "
+                    "imaging_domain TEXT, modality TEXT, object_role TEXT, represented_file_count INTEGER, size_bytes INTEGER, "
+                    "participant_link_status TEXT, representation_provenance_class TEXT, source_system TEXT, "
+                    "source_url TEXT, quality_flag_json TEXT)"
+                )
+                connection.executemany(
+                    "INSERT INTO public_non_dicom_assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [
+                        ("asset1", "Collection", "TEST", "scan", "scan.mha", "", "MHA", "image_volume", "radiology", "CT", "source_image", 1, 10, "reviewed_source_crosswalk", "submitted_original", "tcia_aspera", "https://example.org/source", "{}"),
+                        ("asset2", "Collection", "TEST", "dicom", "", "dicom/", "DICOM", "participant_modality", "radiology", "MR", "submitted_original", 400, 0, "reviewed_source_crosswalk", "submitted_original", "tcia_aspera", "https://example.org/source", "{}"),
+                    ],
+                )
+                connection.execute(
+                    "CREATE TABLE public_non_dicom_asset_participants (asset_participant_id TEXT, asset_id TEXT, "
+                    "subject_id TEXT, raw_subject_id TEXT, subject_id_namespace TEXT, link_status TEXT)"
+                )
+                connection.executemany(
+                    "INSERT INTO public_non_dicom_asset_participants VALUES (?,?,?,?,?,?)",
+                    [
+                        ("ap1", "asset1", "P1", "raw-P1", "tcia_dataset:TEST", "reviewed_source_crosswalk"),
+                        ("ap2", "asset2", "P1", "raw-P1", "tcia_dataset:TEST", "reviewed_source_crosswalk"),
+                    ],
+                )
+                connection.execute(
+                    "CREATE TABLE public_non_dicom_locations (location_id TEXT, asset_id TEXT, "
+                    "representation_provenance_class TEXT)"
+                )
+                connection.executemany(
+                    "INSERT INTO public_non_dicom_locations VALUES (?,?,?)",
+                    [("l1", "asset1", "submitted_original"), ("l2", "asset1", "standardized_representation")],
+                )
+                connection.execute(
+                    "CREATE VIEW agent_public_non_dicom_asset_participants AS "
+                    "SELECT * FROM public_non_dicom_asset_participants"
+                )
+
+            result = load_patient_public_non_dicom(path, "TEST", "P1")
+            self.assertEqual(len(result), 1)
+            self.assertEqual(int(result.iloc[0]["location_count"]), 2)
+            dicom = load_patient_public_non_dicom(
+                path, "TEST", "P1", include_dicom=True
+            )
+            self.assertEqual(len(dicom), 1)
+            self.assertEqual(int(dicom.iloc[0]["represented_file_count"]), 400)
+
+    def test_public_non_dicom_image_metadata_projects_research_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "public.sqlite"
+            with sqlite3.connect(path) as connection:
+                connection.execute(
+                    "CREATE TABLE agent_public_non_dicom_image_metadata ("
+                    "asset_id TEXT, modality TEXT, body_part_examined TEXT, "
+                    "study_description TEXT, series_description TEXT, manufacturer TEXT, "
+                    "manufacturer_model_name TEXT, magnetic_field_strength_t REAL, "
+                    "study_datetime TEXT, acquisition_dimensionality TEXT, "
+                    "scanner_site TEXT, sequence_class TEXT, sequence_tags TEXT, "
+                    "slice_thickness_mm REAL, spacing_between_slices_mm REAL, "
+                    "repetition_time_ms REAL, echo_time_ms REAL, inversion_time_ms REAL, "
+                    "pre_included INTEGER, post_included INTEGER, t2_included INTEGER, "
+                    "flair_included INTEGER, sequences_present TEXT, "
+                    "rows INTEGER, columns INTEGER, number_of_slices INTEGER, "
+                    "pixel_spacing_mm TEXT, pathology_protocol TEXT, magnification TEXT, "
+                    "field_source_ids_json TEXT, populated_field_count INTEGER, "
+                    "conflict_field_count INTEGER)"
+                )
+                connection.execute(
+                    "INSERT INTO agent_public_non_dicom_image_metadata "
+                    "(asset_id, modality, body_part_examined, study_description, "
+                    "series_description, manufacturer, manufacturer_model_name, "
+                    "magnetic_field_strength_t, study_datetime, "
+                    "acquisition_dimensionality, sequence_class, sequence_tags, "
+                    "slice_thickness_mm, rows, columns, number_of_slices, "
+                    "pixel_spacing_mm, pathology_protocol, magnification, "
+                    "field_source_ids_json, populated_field_count, conflict_field_count) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        "asset1", "CT", "HEAD", "Study", "Series", "Vendor",
+                        "Model", None, "2020-01-01", "3D", "T2", "T2; FLAIR",
+                        1.25, 512, 512, 80, "[0.5,0.5]", "", "",
+                        '{"modality":["source-1"]}', 7, 0,
+                    ),
+                )
+
+            result = load_public_non_dicom_image_metadata(path, ["asset1"])
+
+            self.assertEqual(result.iloc[0]["metadata_modality"], "CT")
+            self.assertEqual(result.iloc[0]["body_part_examined"], "HEAD")
+            self.assertEqual(int(result.iloc[0]["number_of_slices"]), 80)
+            self.assertEqual(result.iloc[0]["sequence_class"], "T2")
+
+    def test_public_non_dicom_locations_batch_and_route_pathdb_assets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            public_db = root / "public.sqlite"
+            with sqlite3.connect(public_db) as connection:
+                connection.execute(
+                    "CREATE TABLE agent_public_non_dicom_asset_participants ("
+                    "short_title TEXT, subject_id TEXT, file_name TEXT, package_path TEXT, "
+                    "asset_id TEXT, file_format TEXT, media_kind TEXT, "
+                    "imaging_domain TEXT, modality TEXT)"
+                )
+                connection.executemany(
+                    "INSERT INTO agent_public_non_dicom_asset_participants "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    [
+                        ("PATH", "P1", "slide1.svs", "slides/slide1.svs", "a1", "SVS", "image", "pathology", "SM"),
+                        ("PATH", "P1", "slide2.svs", "slides/slide2.svs", "a2", "SVS", "image", "pathology", "SM"),
+                    ],
+                )
+                connection.execute(
+                    "CREATE TABLE agent_public_non_dicom_locations ("
+                    "location_id TEXT, asset_id TEXT, managed_system TEXT, "
+                    "access_url TEXT, file_name TEXT)"
+                )
+                connection.executemany(
+                    "INSERT INTO agent_public_non_dicom_locations VALUES (?,?,?,?,?)",
+                    [
+                        ("l1", "a1", "tcia_pathdb", "https://pathdb.example/a1", "slide1.svs"),
+                        ("l2", "a2", "aspera", "", "slide2.svs"),
+                    ],
+                )
+
+            locations = load_public_non_dicom_locations(public_db, ["a1", "a2"])
+            self.assertEqual(set(locations["asset_id"]), {"a1", "a2"})
+
+            missing = root / "missing.sqlite"
+            paths = DataPaths(
+                missing, missing, missing, missing, missing, missing,
+                public_non_dicom_db=public_db,
+            )
+            patients = pd.DataFrame([{"short_title": "PATH", "subject_id": "P1"}])
+            routes, unrouted = collect_filtered_imaging_routes(
+                paths,
+                pd.DataFrame(),
+                patients,
+                imaging_sources=["Pathology images"],
+            )
+
+            self.assertEqual(routes["imageUrl"], ["https://pathdb.example/a1"])
+            self.assertEqual(unrouted["item"].tolist(), ["slide2.svs"])
+
+    def test_clinical_longitudinal_observations_remain_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "clinical.sqlite"
+            with sqlite3.connect(path) as connection:
+                connection.execute(
+                    "CREATE TABLE agent_clinical_longitudinal_observations ("
+                    "short_title TEXT, subject_id TEXT, observation_type TEXT, "
+                    "study_datetime TEXT, file_name TEXT, age_at_imaging_years REAL, "
+                    "manufacturer TEXT, manufacturer_model_name TEXT, "
+                    "magnetic_field_strength_t REAL, acquisition_dimensionality TEXT, "
+                    "scanner_site TEXT, sequence_class TEXT, sequence_tags TEXT, "
+                    "slice_thickness_mm REAL, spacing_between_slices_mm REAL, "
+                    "repetition_time_ms REAL, echo_time_ms REAL, inversion_time_ms REAL)"
+                )
+                connection.executemany(
+                    "INSERT INTO agent_clinical_longitudinal_observations "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [
+                        ("TEST", "P1", "scan", "2020-01-01", "scan1.nii.gz", 50, "A", "M1", 3, "3D", "site1", "T1", "PRE", 1, 1, 5, 2, 900),
+                        ("TEST", "p1", "scan", "2021-01-01", "scan2.nii.gz", 51, "B", "M2", 3, "3D", "site2", "T2", "POST", 1, 1, 6, 3, 950),
+                    ],
+                )
+
+            result = load_patient_clinical_longitudinal(path, "TEST", ["P1", "p1"])
+
+            self.assertEqual(result["file_name"].tolist(), ["scan1.nii.gz", "scan2.nii.gz"])
+            self.assertEqual(result["sequence_class"].tolist(), ["T1", "T2"])
+
     def test_patient_nifti_packages_are_subject_scoped_and_public(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "nifti.sqlite"
@@ -395,6 +845,35 @@ class CohortBuilderDataTests(unittest.TestCase):
             memberships["patient_group_key"] == combined["patient_group_key"]
         ]
         self.assertEqual(set(grouped_members["short_title"]), {"Source-Collection", "Derived-Result"})
+
+    def test_dataset_type_filter_uses_source_memberships(self):
+        patients = pd.DataFrame(
+            [
+                {"patient_group_key": "grouped", "subject_id": "P1"},
+                {"patient_group_key": "collection-only", "subject_id": "P2"},
+            ]
+        )
+        memberships = pd.DataFrame(
+            [
+                {"patient_group_key": "grouped", "dataset_type": "Collection", "short_title": "SOURCE"},
+                {"patient_group_key": "grouped", "dataset_type": "Analysis Result", "short_title": "RESULT"},
+                {"patient_group_key": "collection-only", "dataset_type": "Collection", "short_title": "OTHER"},
+            ]
+        )
+
+        analysis_patients, analysis_memberships = (
+            filter_patient_groups_by_dataset_type(
+                patients, memberships, "Analysis Result"
+            )
+        )
+
+        self.assertEqual(analysis_patients["patient_group_key"].tolist(), ["grouped"])
+        self.assertEqual(analysis_memberships["short_title"].tolist(), ["RESULT"])
+        all_patients, all_memberships = filter_patient_groups_by_dataset_type(
+            patients, memberships, "All"
+        )
+        self.assertIs(all_patients, patients)
+        self.assertIs(all_memberships, memberships)
 
     def test_explicit_source_collection_groups_non_idc_analysis_result(self):
         patients = pd.DataFrame(

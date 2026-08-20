@@ -27,6 +27,7 @@ import pandas as pd
 LOGGER = logging.getLogger(__name__)
 POLICY_URL = "https://www.cancerimagingarchive.net/nih-controlled-data-access-policy/"
 OPEN_ACCESS_LEVELS = {"open", "open_noncommercial"}
+DATASET_TYPE_FILTERS = ("All", "Collection", "Analysis Result")
 CLINICAL_CATEGORICAL_COLUMNS = (
     "sex_at_birth",
     "race",
@@ -56,6 +57,7 @@ COHORT_EXPORT_COLUMNS = (
     "age_at_diagnosis",
     "age_at_enrollment_years",
     "age_at_imaging_years",
+    "age_at_treatment_years",
     "primary_diagnosis",
     "primary_site",
     "stage",
@@ -79,10 +81,17 @@ COHORT_EXPORT_COLUMNS = (
     "modalities",
     "body_parts",
     "dicom_series",
+    "public_dicom_files_outside_idc",
+    "public_non_dicom_files",
+    "ct_series",
+    "mha_volumes",
     "nifti_files",
     "pathdb_slides",
+    "pathology_images",
     "controlled_files",
     "imaging_linkage_status",
+    "dataset_unlinked_asset_groups",
+    "participant_link_issue_count",
 )
 CANONICAL_CATEGORY_VALUES = {
     "sex_at_birth": {
@@ -112,31 +121,47 @@ class DataPaths:
     pathology_db: Path
     controlled_db: Path
     idc_parquet: Path
+    participant_db: Path | None = None
+    public_non_dicom_db: Path | None = None
+    bundle_manifest: Path | None = None
+    install_state: Path | None = None
 
-    def signatures(self) -> tuple[tuple[str, int, int], ...]:
+    def signatures(self) -> tuple[tuple[str, int, int, str], ...]:
         """Return stable cache inputs without hashing multi-gigabyte files."""
         result = []
         for path in (
+            self.bundle_manifest,
+            self.install_state,
+            self.participant_db,
             self.snapshot_db,
             self.clinical_db,
-            self.nifti_db,
-            self.pathology_db,
             self.controlled_db,
+            self.public_non_dicom_db,
             self.idc_parquet,
         ):
-            if path.exists():
+            if path is not None and path.exists():
                 stat = path.stat()
-                result.append((str(path), stat.st_mtime_ns, stat.st_size))
+                fingerprint = ""
+                if path.suffix == ".json":
+                    try:
+                        fingerprint = str(
+                            json.loads(path.read_text(encoding="utf-8")).get(
+                                "release_fingerprint", ""
+                            )
+                        )
+                    except (OSError, json.JSONDecodeError):
+                        pass
+                result.append((str(path), stat.st_mtime_ns, stat.st_size, fingerprint))
             else:
-                result.append((str(path), 0, 0))
+                result.append((str(path or ""), 0, 0, ""))
         return tuple(result)
 
     def status_rows(self) -> list[dict[str, object]]:
         labels = {
+            "V2 Participant Inventory": self.participant_db,
+            "V2 public non-DICOM detail": self.public_non_dicom_db,
             "TCIA provenance snapshot": self.snapshot_db,
-            "Clinical sidecar": self.clinical_db,
-            "NIfTI sidecar": self.nifti_db,
-            "Pathology sidecar": self.pathology_db,
+            "Clinical detail": self.clinical_db,
             "Controlled-access metadata": self.controlled_db,
             "IDC series Parquet": self.idc_parquet,
         }
@@ -145,10 +170,10 @@ class DataPaths:
             rows.append(
                 {
                     "Source": label,
-                    "Available": path.exists(),
+                    "Available": path is not None and path.exists(),
                     "Path": str(path),
                     "Size (GB)": round(path.stat().st_size / 1_000_000_000, 3)
-                    if path.exists()
+                    if path is not None and path.exists()
                     else None,
                 }
             )
@@ -166,30 +191,43 @@ def resolve_data_paths(
             if configured_root
             else app_dir.parent / "tcia-query-skill"
         )
-    cache_dir = skill_root.resolve() / "cache"
+    v2_cache_dir = Path(
+        os.environ.get("TCIA_METADATA_V2_CACHE")
+        or os.environ.get("TCIA_V2_INSTALL_DIR")
+        or skill_root / "cache" / "tcia-metadata-v2-latest"
+    ).expanduser().resolve()
 
     def selected(env_name: str, default: Path) -> Path:
         value = os.environ.get(env_name)
         return Path(value).expanduser().resolve() if value else default.resolve()
 
     return DataPaths(
-        snapshot_db=selected("TCIA_SNAPSHOT_DB", cache_dir / "tcia_snapshot.sqlite"),
+        snapshot_db=selected("TCIA_SNAPSHOT_DB", v2_cache_dir / "tcia_snapshot.sqlite"),
         clinical_db=selected(
-            "TCIA_CLINICAL_METADATA_DB", cache_dir / "clinical_metadata.sqlite"
+            "TCIA_CLINICAL_METADATA_DB", v2_cache_dir / "clinical_metadata.sqlite"
         ),
         nifti_db=selected(
-            "TCIA_NIFTI_METADATA_DB", cache_dir / "nifti_metadata.sqlite"
+            "TCIA_NIFTI_METADATA_DB", v2_cache_dir / "nifti_metadata.sqlite"
         ),
         pathology_db=selected(
-            "TCIA_PATHOLOGY_METADATA_DB", cache_dir / "pathology_metadata.sqlite"
+            "TCIA_PATHOLOGY_METADATA_DB", v2_cache_dir / "pathology_metadata.sqlite"
         ),
         controlled_db=selected(
             "TCIA_CONTROLLED_ACCESS_METADATA_DB",
-            cache_dir / "controlled_access_metadata.sqlite",
+            v2_cache_dir / "controlled_access_metadata.sqlite",
         ),
         idc_parquet=selected(
             "TCIA_IDC_METADATA_PARQUET", app_dir / "idc_metadata.parquet"
         ),
+        participant_db=selected(
+            "TCIA_PARTICIPANT_INVENTORY_DB", v2_cache_dir / "participant_inventory.sqlite"
+        ),
+        public_non_dicom_db=selected(
+            "TCIA_PUBLIC_NON_DICOM_METADATA_DB",
+            v2_cache_dir / "public_non_dicom_metadata.sqlite",
+        ),
+        bundle_manifest=v2_cache_dir / "tcia_metadata_v2_bundle_manifest.json",
+        install_state=v2_cache_dir / "tcia_metadata_v2_install.json",
     )
 
 
@@ -552,6 +590,7 @@ def load_clinical_subjects(path: Path) -> pd.DataFrame:
         "age_at_diagnosis",
         "age_at_enrollment_years",
         "age_at_imaging_years",
+        "age_at_treatment_years",
     ):
         if column in frame:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
@@ -668,6 +707,63 @@ def aggregate_idc(frame: pd.DataFrame) -> pd.DataFrame:
     add_unique_text("BodyPartExamined", "dicom_body_parts")
     result["has_idc_dicom_metadata"] = result["dicom_series"] > 0
     return result
+
+
+def load_idc_patient_search_summary(
+    parquet_path: Path,
+    catalog: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Return the narrow participant-level DICOM search enrichment.
+
+    Participant identity and availability remain sourced from the V2 Participant
+    Inventory. IDC supplies the series count, modality, and BodyPartExamined
+    values that the current Participant Inventory contract does not expose.
+    """
+    result_columns = [
+        "short_title",
+        "subject_join_key",
+        "dicom_series_idc",
+        "dicom_modalities",
+        "body_parts",
+    ]
+    columns = [
+        "collection_id",
+        "analysis_result_id",
+        "PatientID",
+        "SeriesInstanceUID",
+        "Modality",
+        "BodyPartExamined",
+    ]
+    try:
+        frame = load_idc_series(parquet_path, catalog, columns=columns)
+    except Exception as exc:  # Keep the primary Participant Inventory usable.
+        LOGGER.warning("Could not load IDC patient search metadata: %s", exc)
+        return pd.DataFrame(columns=result_columns)
+    if frame.empty:
+        return pd.DataFrame(columns=result_columns)
+
+    frame = frame[
+        [
+            "short_title",
+            "subject_id",
+            "SeriesInstanceUID",
+            "Modality",
+            "BodyPartExamined",
+        ]
+    ].copy()
+    frame["subject_join_key"] = subject_join_keys(frame)
+    frame = frame[frame["subject_join_key"] != ""]
+    if frame.empty:
+        return pd.DataFrame(columns=result_columns)
+    return (
+        frame.groupby(["short_title", "subject_join_key"], sort=False)
+        .agg(
+            dicom_series_idc=("SeriesInstanceUID", "nunique"),
+            dicom_modalities=("Modality", join_tokens),
+            body_parts=("BodyPartExamined", join_tokens),
+        )
+        .reset_index()
+    )
 
 
 def aggregate_pathdb(path: Path) -> pd.DataFrame:
@@ -796,190 +892,456 @@ def _outer_merge_sources(
     return result
 
 
-def build_patient_index(paths: DataPaths) -> pd.DataFrame:
-    """Create exactly one row per dataset-scoped patient."""
-    build_started = time.perf_counter()
-    catalog = load_dataset_catalog(paths.snapshot_db)
-    if catalog.empty:
-        raise RuntimeError(
-            f"No visible TCIA dataset catalog found in {paths.snapshot_db}"
+def load_participant_inventory(path: Path | None) -> pd.DataFrame:
+    """Load the V2 participant search surface without touching detail artifacts."""
+    if path is None or preferred_object(path, "agent_participant_search") is None:
+        return pd.DataFrame()
+    return read_sql(path, "SELECT * FROM agent_participant_search")
+
+
+def load_participant_assets(
+    path: Path | None, participant_key: str | None = None
+) -> pd.DataFrame:
+    if path is None or preferred_object(path, "agent_participant_assets") is None:
+        return pd.DataFrame()
+    query = "SELECT * FROM agent_participant_assets"
+    params: list[object] = []
+    if participant_key:
+        query += " WHERE participant_key = ?"
+        params.append(participant_key)
+    return read_sql(path, query, params)
+
+
+def load_participant_identifiers(path: Path | None, participant_key: str) -> pd.DataFrame:
+    if path is None or preferred_object(path, "agent_participant_identifiers") is None:
+        return pd.DataFrame()
+    return read_sql(
+        path,
+        "SELECT * FROM agent_participant_identifiers WHERE participant_key = ? "
+        "ORDER BY managed_system, identifier_namespace, raw_identifier",
+        [participant_key],
+    )
+
+
+def load_participant_identity_evidence(
+    path: Path | None, participant_key: str
+) -> pd.DataFrame:
+    if path is None or preferred_object(path, "agent_participant_identity_evidence") is None:
+        return pd.DataFrame()
+    return read_sql(
+        path,
+        "SELECT * FROM agent_participant_identity_evidence "
+        "WHERE participant_key = ? ORDER BY resolution_method, identity_evidence_id",
+        [participant_key],
+    )
+
+
+def load_participant_inventory_clinical_values(
+    path: Path | None, participant_key: str | None = None
+) -> pd.DataFrame:
+    if path is None or preferred_object(path, "agent_participant_clinical_values") is None:
+        return pd.DataFrame()
+    query = "SELECT * FROM agent_participant_clinical_values"
+    params: list[object] = []
+    if participant_key:
+        query += " WHERE participant_key = ?"
+        params.append(participant_key)
+    return read_sql(path, query, params)
+
+
+def load_dataset_coverage_states(path: Path | None, short_title: str) -> pd.DataFrame:
+    if path is None:
+        return pd.DataFrame()
+    frames: list[pd.DataFrame] = []
+    if preferred_object(path, "agent_dataset_assets_without_participant_crosswalk"):
+        unlinked = read_sql(
+            path,
+            "SELECT 'missing participant crosswalk' AS coverage_state, * "
+            "FROM agent_dataset_assets_without_participant_crosswalk "
+            "WHERE lower(short_title) = lower(?)",
+            [short_title],
         )
-
-    stage_started = time.perf_counter()
-    clinical = load_clinical_subjects(paths.clinical_db)
-    LOGGER.info(
-        "Patient index: loaded %s clinical patients in %.1fs",
-        f"{len(clinical):,}",
-        time.perf_counter() - stage_started,
-    )
-    stage_started = time.perf_counter()
-    idc = aggregate_idc(load_idc_series(paths.idc_parquet, catalog))
-    LOGGER.info(
-        "Patient index: aggregated %s IDC patients in %.1fs",
-        f"{len(idc):,}",
-        time.perf_counter() - stage_started,
-    )
-    stage_started = time.perf_counter()
-    pathdb = aggregate_pathdb(paths.snapshot_db)
-    nifti = aggregate_nifti(paths.nifti_db)
-    controlled = aggregate_controlled(paths.controlled_db)
-    LOGGER.info(
-        "Patient index: loaded PathDB, NIfTI, and controlled metadata in %.1fs",
-        time.perf_counter() - stage_started,
-    )
-
-    stage_started = time.perf_counter()
-    patients = _outer_merge_sources(
-        [
-            ("clinical", clinical),
-            ("idc", idc),
-            ("pathdb", pathdb),
-            ("nifti", nifti),
-            ("controlled", controlled),
-        ]
-    )
-    if patients.empty:
-        return patients
-
-    catalog_columns = [
-        column
-        for column in (
-            "short_title",
-            "dataset_type",
-            "title",
-            "doi",
-            "link",
-            "species",
-            "cancer_types",
-            "cancer_locations",
-            "program",
-            "source_collections",
-            "resolved_access_level",
-            "resolved_controlled_access_policy_url",
-            "licenses",
+        frames.append(unlinked)
+    if preferred_object(path, "agent_participant_link_issues"):
+        issues = read_sql(
+            path,
+            "SELECT 'participant link issue' AS coverage_state, * "
+            "FROM agent_participant_link_issues WHERE lower(short_title) = lower(?)",
+            [short_title],
         )
-        if column in catalog
+        frames.append(issues)
+    nonempty = [frame for frame in frames if not frame.empty]
+    return pd.concat(nonempty, ignore_index=True, sort=False) if nonempty else pd.DataFrame()
+
+
+def participant_availability_rows(
+    participant: Mapping[str, object],
+) -> list[dict[str, str]]:
+    """Translate V2 inventory flags into stable user-facing coverage states."""
+
+    def enabled(name: str) -> bool:
+        value = participant.get(name, False)
+        try:
+            return False if pd.isna(value) else bool(value)
+        except (TypeError, ValueError):
+            return bool(value)
+
+    def count(name: str) -> int:
+        value = participant.get(name, 0)
+        try:
+            return 0 if pd.isna(value) else int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    unlinked = count("dataset_unlinked_asset_groups")
+    public_non_dicom = enabled("has_public_non_dicom")
+    if public_non_dicom and unlinked:
+        non_dicom_state = "Participant linked; dataset also has unlinked asset groups"
+    elif public_non_dicom:
+        non_dicom_state = "Participant linked"
+    elif unlinked:
+        non_dicom_state = "Dataset-level only; participant crosswalk unavailable"
+    else:
+        non_dicom_state = "Not represented in the participant inventory"
+
+    return [
+        {
+            "Data": "Public DICOM",
+            "Coverage": (
+                "Participant linked"
+                if enabled("has_public_dicom")
+                else "Not represented in the participant inventory"
+            ),
+            "Detail": (
+                "Includes public Aspera DICOM outside IDC; IDC series are shown when available."
+                if count("public_dicom_files_outside_idc")
+                else "Series details are queried from IDC."
+            ),
+        },
+        {
+            "Data": "Public non-DICOM",
+            "Coverage": non_dicom_state,
+            "Detail": "Includes public imaging files outside IDC DICOM.",
+        },
+        {
+            "Data": "Clinical data",
+            "Coverage": (
+                "Participant linked"
+                if enabled("has_clinical")
+                else "Not represented in the participant inventory"
+            ),
+            "Detail": "Raw and standardized facts are available from the clinical detail artifact.",
+        },
+        {
+            "Data": "Controlled access",
+            "Coverage": (
+                "Participant-linked metadata"
+                if enabled("has_controlled_metadata")
+                else "Not represented in the participant inventory"
+            ),
+            "Detail": "Authorization is required for controlled payloads.",
+        },
     ]
-    patients = patients.merge(
-        catalog[catalog_columns].drop_duplicates("short_title"),
-        on="short_title",
-        how="inner",
-    )
 
-    pathology_summary = load_pathology_dataset_summary(paths.pathology_db)
-    if not pathology_summary.empty:
+
+def _load_participant_search_index(path: Path | None) -> pd.DataFrame:
+    if path is None or preferred_object(path, "agent_participant_search") is None:
+        return pd.DataFrame()
+    participants = read_sql(
+        path,
+        """
+        SELECT participant_key, dataset_type, short_title,
+               display_participant_id, identity_scope,
+               within_dataset_identity_status, identity_resolution_method,
+               cross_dataset_identity_status
+        FROM participants
+        """,
+    ).rename(
+        columns={"display_participant_id": "subject_id"}
+    )
+    if participants.empty:
+        return participants
+
+    # The schema-6 gate in v2_artifacts makes agent_participant_search the
+    # semantic contract. Mirror that view's predicates over indexed base tables
+    # here because materializing its correlated namespace columns adds tens of
+    # seconds to a cold Streamlit startup. A future schema cannot silently use
+    # these predicates: it is rejected before this query runs.
+    asset_counts = read_sql(
+        path,
+        """
+        SELECT participant_key,
+               COUNT(DISTINCT participant_asset_id) AS inventory_rows,
+               MAX(access_level = 'open') AS has_open_data,
+               MAX(access_level = 'controlled') AS has_controlled_data,
+               MAX(access_level = 'open'
+                   AND instr(upper(COALESCE(file_format, '')), 'DICOM') > 0)
+                 AS has_public_dicom,
+               MAX(source_artifact = 'public_non_dicom_metadata'
+                   AND (COALESCE(file_format, '') = ''
+                        OR instr(upper(file_format), 'DICOM') = 0
+                        OR instr(upper(file_format), 'NIFTI') > 0))
+                 AS has_public_non_dicom,
+               MAX(data_domain = 'clinical') AS has_clinical,
+               group_concat(DISTINCT NULLIF(data_domain, '')) AS data_domains,
+               group_concat(DISTINCT NULLIF(modality, '')) AS modalities,
+               group_concat(DISTINCT NULLIF(file_format, '')) AS file_formats,
+               MAX(access_level = 'controlled') AS has_controlled_metadata,
+               MAX(access_level IN ('open', 'open_noncommercial')
+                   AND managed_system = 'crdc_idc'
+                   AND instr(upper(COALESCE(file_format, '')), 'DICOM') > 0)
+                 AS has_idc_dicom_metadata,
+               SUM(CASE WHEN access_level IN ('open', 'open_noncommercial')
+                              AND managed_system = 'crdc_idc'
+                              AND instr(upper(COALESCE(file_format, '')), 'DICOM') > 0
+                        THEN COALESCE(series_count, 0) ELSE 0 END) AS dicom_series,
+               SUM(CASE WHEN access_level IN ('open', 'open_noncommercial')
+                              AND source_artifact = 'public_non_dicom_metadata'
+                              AND instr(upper(COALESCE(file_format, '')), 'DICOM') > 0
+                        THEN COALESCE(file_count, 0) ELSE 0 END)
+                 AS public_dicom_files_outside_idc,
+               SUM(CASE WHEN source_artifact = 'public_non_dicom_metadata'
+                              AND (COALESCE(file_format, '') = ''
+                                   OR instr(upper(file_format), 'DICOM') = 0
+                                   OR instr(upper(file_format), 'NIFTI') > 0)
+                        THEN COALESCE(file_count, 0) ELSE 0 END) AS public_non_dicom_files,
+               SUM(CASE WHEN managed_system = 'crdc_idc' AND upper(COALESCE(modality, '')) = 'CT'
+                        THEN COALESCE(series_count, 0) ELSE 0 END) AS ct_series,
+               SUM(CASE WHEN upper(COALESCE(file_format, '')) IN ('MHA', 'MHD')
+                        THEN COALESCE(file_count, 0) ELSE 0 END) AS mha_volumes,
+               SUM(CASE WHEN upper(COALESCE(file_format, '')) IN ('NIFTI', 'NII', 'NII.GZ')
+                        THEN COALESCE(file_count, 0) ELSE 0 END) AS nifti_files,
+               SUM(CASE WHEN lower(COALESCE(data_domain, '')) = 'pathology'
+                          OR lower(COALESCE(media_kind, '')) IN ('whole_slide_image', 'microscopy_image')
+                        THEN COALESCE(file_count, 0) ELSE 0 END) AS pathology_images,
+               SUM(CASE WHEN access_level = 'controlled' THEN COALESCE(file_count, 0) ELSE 0 END) AS controlled_files
+        FROM agent_participant_assets
+        GROUP BY participant_key
+        """,
+    )
+    result = participants.merge(asset_counts, on="participant_key", how="left")
+    for column in (
+        "has_open_data", "has_controlled_data", "has_public_dicom",
+        "has_public_non_dicom", "has_clinical",
+    ):
+        result[column] = pd.to_numeric(result.get(column), errors="coerce").fillna(0)
+    for column in (
+        "dicom_series", "public_dicom_files_outside_idc", "public_non_dicom_files",
+        "ct_series", "mha_volumes", "nifti_files", "pathology_images", "controlled_files",
+    ):
+        result[column] = pd.to_numeric(result.get(column), errors="coerce").fillna(0)
+    result["has_idc_dicom_metadata"] = pd.to_numeric(
+        result.get("has_idc_dicom_metadata"), errors="coerce"
+    ).fillna(0)
+    return result
+
+
+def enrich_participants_with_clinical_detail(
+    participants: pd.DataFrame, path: Path
+) -> pd.DataFrame:
+    """Add filterable clinical summaries after the detail artifact is installed."""
+    result = participants.copy()
+    clinical_columns = [
+        "sex_at_birth", "race", "ethnicity", "age_at_baseline",
+        "age_at_diagnosis", "age_at_enrollment_years", "age_at_imaging_years",
+        "age_at_treatment_years",
+        "primary_diagnosis", "primary_site", "stage", "grade", "vital_status",
+        "recurrence", "progression", "response", "screening_result",
+        "days_to_death", "days_to_last_followup", "overall_survival_days",
+        "progression_free_survival_days", "primary_diagnosis_value_role",
+        "primary_site_value_role", "source_kinds", "source_count", "conflict_count",
+        "clinical_subject_ids",
+    ]
+    if not path.exists():
+        for column in clinical_columns:
+            if column not in result:
+                result[column] = pd.NA
+        return result
+
+    clinical = load_clinical_subjects(path)
+    if clinical.empty:
+        for column in clinical_columns:
+            if column not in result:
+                result[column] = pd.NA
+        return result
+
+    result["_clinical_subject_key"] = subject_join_keys(result)
+    clinical["_clinical_subject_key"] = subject_join_keys(clinical)
+    available = [column for column in clinical_columns if column in clinical]
+    detail = clinical[["short_title", "_clinical_subject_key", *available]].copy()
+    detail = detail.drop_duplicates(["short_title", "_clinical_subject_key"], keep="first")
+    result = result.merge(
+        detail,
+        on=["short_title", "_clinical_subject_key"],
+        how="left",
+        validate="many_to_one",
+    ).drop(columns="_clinical_subject_key")
+    for column in clinical_columns:
+        if column not in result:
+            result[column] = pd.NA
+    return result
+
+
+def build_patient_index(paths: DataPaths) -> pd.DataFrame:
+    """Create one row per V2 dataset-scoped participant.
+
+    The compact Participant Inventory is the primary search/summary source.
+    IDC contributes only participant-level DICOM BodyPartExamined filter values.
+    Clinical summaries are merged only after the user has explicitly installed
+    the research-detail clinical artifact.
+    """
+    build_started = time.perf_counter()
+    patients = _load_participant_search_index(paths.participant_db)
+    if patients.empty:
+        raise RuntimeError(
+            f"No V2 participant inventory found in {paths.participant_db}"
+        )
+    patients = enrich_participants_with_clinical_detail(patients, paths.clinical_db)
+    open_mask = patients["has_open_data"].astype(bool)
+    controlled_mask = patients["has_controlled_data"].astype(bool)
+    patients["resolved_access_level"] = "unknown"
+    patients.loc[open_mask, "resolved_access_level"] = "open"
+    patients.loc[controlled_mask, "resolved_access_level"] = "controlled"
+    patients.loc[open_mask & controlled_mask, "resolved_access_level"] = "mixed"
+
+    available = pd.Series("", index=patients.index, dtype="object")
+    for label, mask in (
+        ("Public DICOM", patients["has_public_dicom"].astype(bool)),
+        ("MHA volumes", patients["mha_volumes"] > 0),
+        ("NIfTI files", patients["nifti_files"] > 0),
+        ("Pathology images", patients["pathology_images"] > 0),
+        ("Clinical data", patients["has_clinical"].astype(bool)),
+    ):
+        separator = available.where(available == "", "; ")
+        available = available.where(~mask, available + separator + label)
+    patients["available_imaging"] = available
+
+    catalog = load_dataset_catalog(paths.snapshot_db)
+    if not catalog.empty:
         keep = [
             column
             for column in (
-                "short_title",
-                "download_records",
-                "pathdb_collection_slide_count",
-                "pathdb_collection_patient_count",
-                "package_inventory_status",
-                "has_pathology_aspera",
+                "short_title", "title", "doi", "link", "species", "cancer_types",
+                "cancer_locations", "program", "source_collections",
+                "resolved_controlled_access_policy_url", "licenses",
             )
-            if column in pathology_summary
+            if column in catalog
         ]
         patients = patients.merge(
-            pathology_summary[keep].drop_duplicates("short_title"),
-            on="short_title",
-            how="left",
+            catalog[keep].drop_duplicates("short_title"), on="short_title", how="left"
         )
 
-    bool_columns = (
-        "has_clinical",
-        "has_idc_dicom_metadata",
-        "has_pathdb",
-        "has_nifti",
-        "has_controlled_metadata",
-        "has_pathology_aspera",
+    idc_search = load_idc_patient_search_summary(paths.idc_parquet, catalog)
+    if not idc_search.empty:
+        patients["subject_join_key"] = subject_join_keys(patients)
+        patients = patients.merge(
+            idc_search,
+            on=["short_title", "subject_join_key"],
+            how="left",
+        ).drop(columns="subject_join_key")
+        patients["dicom_series"] = pd.concat(
+            [
+                pd.to_numeric(patients["dicom_series"], errors="coerce"),
+                pd.to_numeric(patients["dicom_series_idc"], errors="coerce"),
+            ],
+            axis=1,
+        ).max(axis=1, skipna=True)
+        patients["modalities"] = patients.apply(
+            lambda row: join_tokens(
+                [row.get("modalities"), row.get("dicom_modalities")]
+            ),
+            axis=1,
+        )
+        patients = patients.drop(
+            columns=["dicom_series_idc", "dicom_modalities"]
+        )
+
+    unlinked = read_sql(
+        paths.participant_db,
+        "SELECT short_title, COUNT(*) AS dataset_unlinked_asset_groups "
+        "FROM agent_dataset_assets_without_participant_crosswalk GROUP BY short_title",
     )
-    for column in bool_columns:
+    issues = read_sql(
+        paths.participant_db,
+        "SELECT short_title, lower(trim(raw_identifier)) AS _issue_subject_key, "
+        "COUNT(*) AS participant_link_issue_count FROM agent_participant_link_issues "
+        "WHERE COALESCE(trim(raw_identifier), '') <> '' "
+        "GROUP BY short_title, lower(trim(raw_identifier))",
+    )
+    if not unlinked.empty:
+        patients = patients.merge(unlinked, on="short_title", how="left")
+    if not issues.empty:
+        patients["_issue_subject_key"] = patients["subject_id"].astype(str).str.strip().str.casefold()
+        patients = patients.merge(
+            issues, on=["short_title", "_issue_subject_key"], how="left"
+        ).drop(columns="_issue_subject_key")
+
+    for column in (
+        "dicom_series", "public_dicom_files_outside_idc", "public_non_dicom_files",
+        "ct_series", "mha_volumes", "nifti_files", "pathology_images", "controlled_files",
+        "dataset_unlinked_asset_groups", "participant_link_issue_count",
+    ):
+        if column not in patients:
+            patients[column] = 0
+        patients[column] = pd.to_numeric(patients[column], errors="coerce").fillna(0).astype(int)
+    for column in (
+        "has_public_dicom", "has_public_non_dicom", "has_clinical", "has_controlled_metadata"
+    ):
         if column not in patients:
             patients[column] = False
         patients[column] = patients[column].astype("boolean").fillna(False).astype(bool)
-
-    # IDC's published index is an open-access asset inventory. Dataset-level
-    # WordPress access is retained separately and must not override the access
-    # mechanism or license attached to a more granular IDC series.
-    patients["has_public_dicom"] = patients["has_idc_dicom_metadata"]
-
-    if "has_imaging" not in patients:
-        patients["has_imaging"] = 0
-    patients["has_imaging"] = (
-        pd.to_numeric(patients["has_imaging"], errors="coerce").fillna(0) > 0
+    patients["has_idc_dicom_metadata"] = patients[
+        "has_idc_dicom_metadata"
+    ].astype("boolean").fillna(False).astype(bool)
+    patients["has_public_dicom_outside_idc"] = (
+        patients["public_dicom_files_outside_idc"] > 0
     )
+    patients["has_nifti"] = patients["nifti_files"] > 0
+    patients["has_pathdb"] = patients["pathology_images"] > 0
+    patients["has_pathology_aspera"] = False
+    patients["pathdb_slides"] = patients["pathology_images"]
+    diagnosis_role = patients.get(
+        "primary_diagnosis_value_role", pd.Series("", index=patients.index)
+    )
+    site_role = patients.get(
+        "primary_site_value_role", pd.Series("", index=patients.index)
+    )
+    patients["primary_diagnosis_is_inferred"] = diagnosis_role.eq("inferred")
+    patients["primary_site_is_inferred"] = site_role.eq("inferred")
     patients["has_any_imaging"] = patients[
-        [
-            "has_idc_dicom_metadata",
-            "has_pathdb",
-            "has_nifti",
-            "has_controlled_metadata",
-        ]
+        ["has_public_dicom", "has_public_non_dicom", "has_controlled_metadata"]
     ].any(axis=1)
-    patients["imaging_linkage_status"] = patients["has_any_imaging"].map(
-        {True: "Linked", False: "Needs artifact linkage review"}
+    patients["imaging_linkage_status"] = "Participant-linked inventory"
+    patients.loc[
+        (patients["dataset_unlinked_asset_groups"] > 0)
+        | (patients["participant_link_issue_count"] > 0),
+        "imaging_linkage_status",
+    ] = "Partial coverage or linkage review"
+    patients["patient_key"] = patients["participant_key"]
+    patients["dataset_memberships"] = patients.apply(
+        lambda row: f"{row['short_title']} [{row['dataset_type']}]", axis=1
     )
-    # NLST is a documented exception: IDC's clinical tables include subjects
-    # outside TCIA's published imaging cohort. Do not present those clinical-only
-    # records as TCIA patients. Other unlinked records remain visible so source
-    # extraction and crosswalk gaps can be audited instead of hidden.
-    patients = exclude_nlst_clinical_only(patients)
-
-    def sources_for(row: pd.Series) -> str:
-        labels = []
-        if row["has_public_dicom"]:
-            labels.append("IDC DICOM")
-        if row["has_nifti"]:
-            labels.append("NIfTI")
-        if row["has_pathdb"]:
-            labels.append("PathDB")
-        if row["has_controlled_metadata"]:
-            labels.append("Controlled-access file metadata")
-        return "; ".join(labels)
-
-    patients["available_imaging"] = patients.apply(sources_for, axis=1)
-    modality_columns = [
-        column
-        for column in (
-            "dicom_modalities",
-            "nifti_modalities",
-            "pathdb_modalities",
-            "controlled_modalities",
-        )
-        if column in patients
-    ]
-    body_part_columns = [
-        column
-        for column in (
-            "dicom_body_parts",
-            "nifti_body_parts",
-            "pathdb_body_parts",
-            "controlled_body_parts",
-        )
-        if column in patients
-    ]
-    patients["modalities"] = patients[modality_columns].apply(
-        lambda row: join_tokens(row.tolist()), axis=1
+    patients["dataset_count"] = 1
+    patients["member_short_titles_json"] = patients["short_title"].map(
+        lambda value: json.dumps([str(value)], separators=(",", ":"))
     )
-    patients["body_parts"] = patients[body_part_columns].apply(
-        lambda row: join_tokens(row.tolist()), axis=1
+    patients["member_patient_keys_json"] = patients["participant_key"].map(
+        lambda value: json.dumps([str(value)], separators=(",", ":"))
     )
-    patients["patient_key"] = (
-        patients["short_title"].astype(str)
-        + "|"
-        + patients["subject_id"].astype(str)
+    patients["member_subject_ids_json"] = patients["subject_id"].map(
+        lambda value: json.dumps([str(value)], separators=(",", ":"))
     )
-    patients = patients.drop_duplicates("patient_key", keep="first")
+    patients["is_grouped_patient"] = False
+    if "body_parts" not in patients:
+        patients["body_parts"] = ""
+    patients["body_parts"] = patients["body_parts"].fillna("")
     patients = canonicalize_patient_categories(patients)
     patients = patients.sort_values(
         ["short_title", "subject_id"], key=lambda series: series.astype(str).str.casefold()
     ).reset_index(drop=True)
     LOGGER.info(
-        "Patient index: linked and normalized %s patients in %.1fs (%.1fs total)",
-        f"{len(patients):,}",
-        time.perf_counter() - stage_started,
-        time.perf_counter() - build_started,
+        "Participant Inventory: loaded %s dataset-scoped participants in %.1fs",
+        f"{len(patients):,}", time.perf_counter() - build_started,
     )
     return patients
 
@@ -1103,6 +1465,10 @@ def build_grouped_patient_index(
         combined["member_patient_keys_json"] = json.dumps(
             member_keys, separators=(",", ":")
         )
+        combined["member_subject_ids_json"] = json.dumps(
+            list(dict.fromkeys(group["subject_id"].astype(str))),
+            separators=(",", ":"),
+        )
         combined["is_grouped_patient"] = len(member_titles) > 1
 
         for column in (
@@ -1115,6 +1481,7 @@ def build_grouped_patient_index(
                 combined[column] = join_tokens(group[column].tolist())
         for column in (
             "dicom_series",
+            "public_non_dicom_files",
             "dicom_studies",
             "dicom_timepoints",
             "nifti_files",
@@ -1181,6 +1548,9 @@ def build_grouped_patient_index(
     singles["member_patient_keys_json"] = singles["patient_key"].map(
         lambda value: json.dumps([str(value)], separators=(",", ":"))
     )
+    singles["member_subject_ids_json"] = singles["subject_id"].map(
+        lambda value: json.dumps([str(value)], separators=(",", ":"))
+    )
     singles["is_grouped_patient"] = False
 
     grouped_rows = [
@@ -1197,6 +1567,26 @@ def build_grouped_patient_index(
         key=lambda series: series.astype(str).str.casefold(),
     ).reset_index(drop=True)
     return grouped, members
+
+
+def filter_patient_groups_by_dataset_type(
+    patients: pd.DataFrame,
+    memberships: pd.DataFrame,
+    dataset_type: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Filter displayed patient groups and source memberships by dataset type."""
+    if dataset_type not in DATASET_TYPE_FILTERS:
+        raise ValueError(f"Unsupported dataset type filter: {dataset_type}")
+    if dataset_type == "All":
+        return patients, memberships
+    scoped_memberships = memberships[
+        memberships["dataset_type"].astype(str).eq(dataset_type)
+    ].copy()
+    group_keys = set(scoped_memberships["patient_group_key"].astype(str))
+    scoped_patients = patients[
+        patients["patient_group_key"].astype(str).isin(group_keys)
+    ].copy()
+    return scoped_patients, scoped_memberships
 
 
 def load_patient_clinical_facts(
@@ -1225,6 +1615,42 @@ def load_patient_clinical_facts(
         FROM {source}
         WHERE short_title = ? AND subject_id IN ({placeholders})
         ORDER BY concept, source_priority DESC, source_kind
+        """,
+        (short_title, *identifiers),
+    )
+
+
+def load_patient_clinical_longitudinal(
+    path: Path,
+    short_title: str,
+    subject_ids: Sequence[str],
+) -> pd.DataFrame:
+    """Return visit-, scanner-, and file-grain observations without collapsing time."""
+    source = preferred_object(
+        path,
+        "agent_clinical_longitudinal_observations",
+        "clinical_longitudinal_observations",
+    )
+    identifiers = [
+        str(value).strip() for value in subject_ids if str(value).strip()
+    ]
+    if not source or not identifiers:
+        return pd.DataFrame()
+    placeholders = ",".join("?" for _ in identifiers)
+    return read_sql(
+        path,
+        f"""
+        SELECT observation_type, study_datetime, file_name,
+               age_at_imaging_years, manufacturer, manufacturer_model_name,
+               magnetic_field_strength_t, acquisition_dimensionality,
+               scanner_site, sequence_class, sequence_tags,
+               slice_thickness_mm, spacing_between_slices_mm,
+               repetition_time_ms, echo_time_ms, inversion_time_ms
+        FROM {source}
+        WHERE lower(short_title) = lower(?)
+          AND subject_id IN ({placeholders})
+        ORDER BY COALESCE(study_datetime, ''), observation_type,
+                 COALESCE(file_name, '')
         """,
         (short_title, *identifiers),
     )
@@ -1290,7 +1716,7 @@ def load_patient_pathdb(
                wsiimage_url AS imageUrl, species, cancer_type, cancer_location,
                data_format, modality, protocol, magnification, "update"
         FROM {source}
-        WHERE lower(collection) = lower(?) AND patient_id = ?
+        WHERE lower(collection) = lower(?) AND lower(patient_id) = lower(?)
         ORDER BY "update", slide_id
         """,
         (short_title, subject_id),
@@ -1312,7 +1738,7 @@ def load_patient_nifti(
                series_id_source, object_type, is_derived_object,
                quality_flag_json
         FROM {source}
-        WHERE short_title = ? AND subject_id = ?
+        WHERE lower(short_title) = lower(?) AND lower(subject_id) = lower(?)
         ORDER BY COALESCE(NULLIF(study_date, ''), NULLIF(series_date, '')),
                  study_id, series_id, file_name
         """,
@@ -1388,18 +1814,7 @@ def load_patient_nifti_packages(
     if packages.empty:
         return pd.DataFrame(columns=columns)
 
-    def is_public_aspera_package(value: object) -> bool:
-        parsed = urlparse(str(value).strip())
-        allowed_paths = {"", "/aspera/faspex/public/package"}
-        return (
-            parsed.scheme == "https"
-            and (parsed.hostname or "").casefold()
-            == "faspex.cancerimagingarchive.net"
-            and parsed.path.rstrip("/") in allowed_paths
-            and bool(parse_qs(parsed.query).get("context"))
-        )
-
-    packages = packages[packages["download_url"].map(is_public_aspera_package)]
+    packages = packages[packages["download_url"].map(is_public_aspera_package_url)]
     packages = packages.drop_duplicates(subset=["download_url"], keep="first")
     for column in columns:
         if column not in packages:
@@ -1407,6 +1822,66 @@ def load_patient_nifti_packages(
     return packages[columns].sort_values(
         ["download_label", "download_id"], kind="stable", na_position="last"
     ).reset_index(drop=True)
+
+
+def is_public_aspera_package_url(value: object) -> bool:
+    """Accept only the two public TCIA Faspex URL shapes exposed by WordPress."""
+    parsed = urlparse(str(value).strip())
+    allowed_paths = {"", "/aspera/faspex/public/package"}
+    return (
+        parsed.scheme == "https"
+        and (parsed.hostname or "").casefold()
+        == "faspex.cancerimagingarchive.net"
+        and parsed.path.rstrip("/") in allowed_paths
+        and bool(parse_qs(parsed.query).get("context"))
+    )
+
+
+def load_dataset_aspera_packages(path: Path, short_title: str) -> pd.DataFrame:
+    """Return current public WordPress Aspera packages for one TCIA dataset."""
+    columns = [
+        "download_id", "download_title", "download_url", "download_size",
+        "download_size_unit", "subjects", "images", "file_types", "data_types",
+        "requirements_label", "requirements_url", "license_label", "access_level",
+    ]
+    source = preferred_object(path, "agent_current_downloads")
+    if not source:
+        return pd.DataFrame(columns=columns)
+    available = read_sql(path, f"SELECT * FROM {source} LIMIT 0").columns
+    selected = [column for column in columns if column in available]
+    packages = read_sql(
+        path,
+        f"SELECT {', '.join(selected)} FROM {source} "
+        "WHERE short_title = ? AND COALESCE(hidden, 0) = 0",
+        (short_title,),
+    )
+    if packages.empty or "download_url" not in packages:
+        return pd.DataFrame(columns=columns)
+    if "controlled_access" in available:
+        # The public snapshot contract should already resolve this through
+        # access_level, but retain the source flag as a second safety gate.
+        controlled = read_sql(
+            path,
+            f"SELECT download_id, controlled_access FROM {source} "
+            "WHERE short_title = ? AND COALESCE(hidden, 0) = 0",
+            (short_title,),
+        )
+        packages = packages.merge(controlled, on="download_id", how="left")
+        packages = packages[
+            pd.to_numeric(packages["controlled_access"], errors="coerce").fillna(0) == 0
+        ].drop(columns=["controlled_access"])
+    if "access_level" in packages:
+        packages = packages[
+            packages["access_level"].fillna("").astype(str).str.casefold().isin(
+                OPEN_ACCESS_LEVELS
+            )
+        ]
+    packages = packages[packages["download_url"].map(is_public_aspera_package_url)]
+    packages = packages.drop_duplicates(subset=["download_url"], keep="first")
+    for column in columns:
+        if column not in packages:
+            packages[column] = ""
+    return packages[columns].reset_index(drop=True)
 
 
 def load_patient_controlled(
@@ -1427,12 +1902,146 @@ def load_patient_controlled(
                series_date, study_description, series_description,
                protocol_name, image_count, quality_flag_json
         FROM {source}
-        WHERE short_title = ?
-          AND COALESCE(NULLIF(TRIM(patient_id), ''),
-                       NULLIF(TRIM(participant_id), '')) = ?
+        WHERE lower(short_title) = lower(?)
+          AND lower(COALESCE(NULLIF(TRIM(patient_id), ''),
+                            NULLIF(TRIM(participant_id), ''))) = lower(?)
         ORDER BY study_date, study_instance_uid, series_instance_uid, file_name
         """,
         (short_title, subject_id),
+    )
+
+
+def load_patient_public_non_dicom(
+    path: Path | None,
+    short_title: str,
+    subject_id: str,
+    *,
+    include_dicom: bool = False,
+) -> pd.DataFrame:
+    """Return logical public assets once each, not once per delivery location.
+
+    The physical V2 component retains its historical public-non-DICOM name but
+    also carries reviewed Aspera-only public DICOM exceptions. Callers must opt
+    into those DICOM rows so they are never presented as non-DICOM files.
+    """
+    if path is None or preferred_object(
+        path, "agent_public_non_dicom_asset_participants"
+    ) is None:
+        return pd.DataFrame()
+    format_predicate = (
+        "instr(upper(COALESCE(a.file_format, '')), 'DICOM') > 0"
+        if include_dicom
+        else "instr(upper(COALESCE(a.file_format, '')), 'DICOM') = 0"
+    )
+    return read_sql(
+        path,
+        f"""
+        SELECT a.asset_id, a.dataset_type, a.short_title, a.asset_name,
+               a.file_name, a.package_path, a.file_format, a.media_kind,
+               a.imaging_domain, a.modality, a.object_role,
+               a.represented_file_count, a.size_bytes,
+               a.participant_link_status, a.representation_provenance_class,
+               a.source_system, a.source_url, a.quality_flag_json,
+               ap.raw_subject_id, ap.subject_id_namespace, ap.link_status,
+               COUNT(DISTINCT l.location_id) AS location_count,
+               group_concat(DISTINCT l.representation_provenance_class)
+                 AS available_representations
+        FROM public_non_dicom_asset_participants ap
+        JOIN public_non_dicom_assets a USING(asset_id)
+        LEFT JOIN public_non_dicom_locations l USING(asset_id)
+        WHERE a.short_title = ?
+          AND ap.subject_id = ?
+          AND {format_predicate}
+        GROUP BY a.asset_id, ap.asset_participant_id
+        ORDER BY lower(COALESCE(a.file_name, a.asset_name, a.asset_id))
+        """,
+        (short_title, subject_id),
+    )
+
+
+def load_public_non_dicom_image_metadata(
+    path: Path | None, asset_ids: Sequence[str]
+) -> pd.DataFrame:
+    if (
+        path is None
+        or not asset_ids
+        or preferred_object(path, "agent_public_non_dicom_image_metadata") is None
+    ):
+        return pd.DataFrame()
+    unique_ids = list(dict.fromkeys(str(value) for value in asset_ids if str(value)))
+    placeholders = ",".join("?" for _ in unique_ids)
+    return read_sql(
+        path,
+        f"""
+        SELECT asset_id, modality AS metadata_modality, body_part_examined,
+               study_description, series_description, manufacturer,
+               manufacturer_model_name, magnetic_field_strength_t,
+               study_datetime, acquisition_dimensionality, scanner_site,
+               sequence_class, sequence_tags, slice_thickness_mm,
+               spacing_between_slices_mm, repetition_time_ms, echo_time_ms,
+               inversion_time_ms, pre_included, post_included, t2_included,
+               flair_included, sequences_present, rows, columns,
+               number_of_slices, pixel_spacing_mm, pathology_protocol,
+               magnification, field_source_ids_json, populated_field_count,
+               conflict_field_count
+        FROM agent_public_non_dicom_image_metadata
+        WHERE asset_id IN ({placeholders})
+        ORDER BY asset_id
+        """,
+        unique_ids,
+    )
+
+
+def load_public_non_dicom_metadata_coverage(
+    path: Path | None, short_title: str
+) -> pd.DataFrame:
+    if path is None or preferred_object(
+        path, "agent_public_non_dicom_metadata_field_coverage"
+    ) is None:
+        return pd.DataFrame()
+    return read_sql(
+        path,
+        "SELECT * FROM agent_public_non_dicom_metadata_field_coverage "
+        "WHERE lower(short_title) = lower(?) ORDER BY field_name",
+        [short_title],
+    )
+
+
+def load_public_non_dicom_metadata_notes(
+    path: Path | None, short_title: str
+) -> pd.DataFrame:
+    if path is None or preferred_object(
+        path, "agent_public_non_dicom_dataset_metadata_notes"
+    ) is None:
+        return pd.DataFrame()
+    return read_sql(
+        path,
+        "SELECT * FROM agent_public_non_dicom_dataset_metadata_notes "
+        "WHERE lower(short_title) = lower(?) "
+        "ORDER BY CASE severity WHEN 'error' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, "
+        "field_name, note_code",
+        [short_title],
+    )
+
+
+def load_public_non_dicom_locations(
+    path: Path | None, asset_ids: str | Sequence[str]
+) -> pd.DataFrame:
+    source = (
+        preferred_object(path, "agent_public_non_dicom_locations")
+        if path is not None
+        else None
+    )
+    values = [asset_ids] if isinstance(asset_ids, str) else list(asset_ids)
+    unique_ids = list(dict.fromkeys(str(value) for value in values if str(value)))
+    if not source or not unique_ids:
+        return pd.DataFrame()
+    placeholders = ",".join("?" for _ in unique_ids)
+    return read_sql(
+        path,
+        f"SELECT * FROM {source} WHERE asset_id IN ({placeholders}) "
+        "ORDER BY file_name, managed_system, location_id",
+        unique_ids,
     )
 
 
@@ -1665,9 +2274,9 @@ def _read_export_rows(
         f"""
         SELECT {select_sql}
         FROM {source}
-        WHERE lower({dataset_column}) IN ({placeholders})
+        WHERE {dataset_column} IN ({placeholders})
         """,
-        tuple(value.casefold() for value in short_titles),
+        tuple(short_titles),
     )
 
 
@@ -1687,10 +2296,17 @@ def collect_filtered_imaging_routes(
     if patients.empty:
         return routes, pd.DataFrame()
 
-    requested = set(imaging_sources) or {
+    source_aliases = {
+        "DICOM series": "IDC DICOM",
+        "Public DICOM": "IDC DICOM",
+        "MHA volumes": "Public non-DICOM",
+        "NIfTI files": "Public non-DICOM",
+        "Pathology images": "Public non-DICOM",
+        "Controlled access": "Controlled-access file metadata",
+    }
+    requested = {source_aliases.get(value, value) for value in imaging_sources} or {
         "IDC DICOM",
-        "NIfTI",
-        "PathDB",
+        "Public non-DICOM",
         "Controlled-access file metadata",
     }
     short_titles = sorted(set(patients["short_title"].dropna().astype(str)))
@@ -1783,34 +2399,6 @@ def collect_filtered_imaging_routes(
             "Series Instance UID is missing.",
         )
 
-    if "PathDB" in requested:
-        pathdb = _read_export_rows(
-            paths.snapshot_db,
-            ("agent_pathdb_slides", "pathdb_rows"),
-            (
-                "collection AS short_title, TRIM(patient_id) AS subject_id, "
-                "slide_id, wsiimage_url AS imageUrl, modality, "
-                "cancer_location AS body_part_examined"
-            ),
-            "collection",
-            short_titles,
-        )
-        pathdb = filter_rows(pathdb)
-        routed = (
-            pathdb.get("imageUrl", pd.Series(index=pathdb.index, dtype=str))
-            .fillna("")
-            .astype(str)
-            .str.strip()
-            != ""
-        )
-        routes["imageUrl"] = pathdb.loc[routed, "imageUrl"].astype(str).tolist()
-        retain_unrouted(
-            pathdb.loc[~routed],
-            "PathDB",
-            "slide_id",
-            "No direct imageUrl is available.",
-        )
-
     if "Controlled-access file metadata" in requested:
         controlled = _read_export_rows(
             paths.controlled_db,
@@ -1825,38 +2413,111 @@ def collect_filtered_imaging_routes(
             short_titles,
         )
         controlled = filter_rows(controlled)
-        routed = (
-            controlled.get("drs_uri", pd.Series(index=controlled.index, dtype=str))
-            .fillna("")
-            .astype(str)
-            .str.strip()
-            != ""
-        )
-        routes["drs_uri"] = controlled.loc[routed, "drs_uri"].astype(str).tolist()
-        retain_unrouted(
-            controlled.loc[~routed],
-            "Controlled-access metadata",
-            "file_name",
-            "No authorized DRS route is available in the metadata.",
-        )
+        if not controlled.empty and "drs_uri" in controlled:
+            routed = controlled["drs_uri"].fillna("").astype(str).str.strip() != ""
+            routes["drs_uri"] = controlled.loc[routed, "drs_uri"].astype(str).tolist()
+            retain_unrouted(
+                controlled.loc[~routed],
+                "Controlled-access metadata",
+                "file_name",
+                "No authorized DRS route is available in the metadata.",
+            )
 
-    if "NIfTI" in requested:
-        nifti = _read_export_rows(
-            paths.nifti_db,
-            ("agent_nifti_files", "radiology_series"),
+    if (
+        "Public non-DICOM" in requested
+        and paths.public_non_dicom_db is not None
+        and paths.public_non_dicom_db.exists()
+    ):
+        public_non_dicom = _read_export_rows(
+            paths.public_non_dicom_db,
+            ("agent_public_non_dicom_asset_participants",),
             (
-                "short_title, TRIM(subject_id) AS subject_id, file_name, "
-                "package_path, modality, body_part_examined"
+                "short_title, TRIM(subject_id) AS subject_id, file_name, package_path, "
+                "asset_id, file_format, media_kind, imaging_domain, modality, "
+                "'' AS body_part_examined"
             ),
             "short_title",
             short_titles,
         )
-        nifti = filter_rows(nifti)
+        public_non_dicom = filter_rows(public_non_dicom)
+        public_non_dicom = public_non_dicom[
+            ~public_non_dicom["file_format"]
+            .fillna("")
+            .astype(str)
+            .str.upper()
+            .str.contains("DICOM", regex=False)
+        ].copy()
+        if imaging_sources:
+            format_values = public_non_dicom["file_format"].fillna("").astype(str).str.upper()
+            domain_values = public_non_dicom["imaging_domain"].fillna("").astype(str).str.casefold()
+            selected_mask = pd.Series(False, index=public_non_dicom.index)
+            if "MHA volumes" in imaging_sources:
+                selected_mask |= format_values.str.contains(
+                    r"(?:^|[,; ])MH[AD](?:$|[,; ])", regex=True
+                )
+            if "NIfTI files" in imaging_sources:
+                selected_mask |= format_values.str.contains("NIFTI", regex=False)
+            if "Pathology images" in imaging_sources:
+                selected_mask |= domain_values.eq("pathology")
+            if any(
+                value in imaging_sources
+                for value in ("MHA volumes", "NIfTI files", "Pathology images")
+            ):
+                public_non_dicom = public_non_dicom[selected_mask].copy()
+
+        locations = load_public_non_dicom_locations(
+            paths.public_non_dicom_db,
+            public_non_dicom.get("asset_id", pd.Series(dtype=str)).astype(str).tolist(),
+        )
+        direct_locations = pd.DataFrame()
+        if not locations.empty:
+            direct_locations = locations[
+                locations["managed_system"].fillna("").astype(str).eq("tcia_pathdb")
+                & locations["access_url"].fillna("").astype(str).str.strip().ne("")
+            ].copy()
+            routes.setdefault("imageUrl", []).extend(
+                direct_locations["access_url"].astype(str).tolist()
+            )
+        directly_routed = set(
+            direct_locations.get("asset_id", pd.Series(dtype=str)).astype(str)
+        )
         retain_unrouted(
-            nifti,
-            "NIfTI",
+            public_non_dicom[
+                ~public_non_dicom["asset_id"].astype(str).isin(directly_routed)
+            ],
+            "Public non-DICOM",
             "file_name",
-            "Package metadata has no supported TCIA Data Retriever route.",
+            "Available through a dataset-level package; not a TCIA Data Retriever route.",
+        )
+
+    if (
+        "IDC DICOM" in requested
+        and paths.public_non_dicom_db is not None
+        and paths.public_non_dicom_db.exists()
+    ):
+        packaged_dicom = _read_export_rows(
+            paths.public_non_dicom_db,
+            ("agent_public_non_dicom_asset_participants",),
+            (
+                "short_title, TRIM(subject_id) AS subject_id, file_name, package_path, "
+                "file_format, modality, '' AS body_part_examined"
+            ),
+            "short_title",
+            short_titles,
+        )
+        packaged_dicom = packaged_dicom[
+            packaged_dicom["file_format"]
+            .fillna("")
+            .astype(str)
+            .str.upper()
+            .str.contains("DICOM", regex=False)
+        ].copy()
+        packaged_dicom = filter_rows(packaged_dicom)
+        retain_unrouted(
+            packaged_dicom,
+            "Public DICOM outside IDC",
+            "file_name",
+            "Available through a dataset-level Aspera package; not an IDC series route.",
         )
 
     clean_routes = {
