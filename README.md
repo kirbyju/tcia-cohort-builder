@@ -107,18 +107,17 @@ uses the same command.
 
 ## Alpha server update
 
-After revised code and matching SQLite release assets have been published, the
-Ubuntu deployment can be updated in place with:
+After revised code and matching SQLite release assets have been published,
+fast-forward both server checkouts and install the stable `research_detail`
+profile into a new, versioned directory with the query-skill bundle installer.
+Point Streamlit, MCP, and REST at that same installation, restart all three
+services, and validate their V2 surfaces before removing the previous bundle.
 
-```bash
-cd /home/exouser/tcia-cohort-builder
-./scripts/update_server.sh
-```
-
-The server procedure must install the same stable bundle profiles used here and
-validate the Streamlit, MCP, and REST V2 surfaces after restart. Review
-`scripts/update_server.sh` against the locally tested release contract before
-running it; the deployment-specific upgrade is intentionally a separate step.
+The exact service units, environment files, reverse-proxy configuration, and
+storage paths are deployment-specific. Follow the query-skill
+[deployment guide](https://github.com/kirbyju/tcia-query-skill/blob/main/mcp_server/DEPLOYMENT.md)
+for the supported variables, ports, installer, and smoke tests rather than an
+unchecked host-specific update script.
 
 ## Tests
 
