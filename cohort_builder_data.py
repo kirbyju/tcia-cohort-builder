@@ -80,7 +80,10 @@ COHORT_EXPORT_COLUMNS = (
     "available_imaging",
     "modalities",
     "body_parts",
+    "file_formats",
+    "has_annotations",
     "dicom_series",
+    "dicom_timepoints",
     "public_dicom_files_outside_idc",
     "public_non_dicom_files",
     "ct_series",
@@ -88,6 +91,8 @@ COHORT_EXPORT_COLUMNS = (
     "nifti_files",
     "pathdb_slides",
     "pathology_images",
+    "pathology_protocols",
+    "pathology_magnifications",
     "controlled_files",
     "imaging_linkage_status",
     "dataset_unlinked_asset_groups",
@@ -371,6 +376,37 @@ def join_tokens(values: Iterable[object]) -> str:
     for value in values:
         tokens.update(split_tokens(value))
     return "; ".join(sorted(tokens, key=str.casefold))
+
+
+def join_token_json(values: Iterable[object]) -> str:
+    """Return a JSON token list without losing commas inside source values."""
+    tokens: set[str] = set()
+    for value in values:
+        tokens.update(split_tokens(value))
+    return json.dumps(sorted(tokens, key=str.casefold), separators=(",", ":"))
+
+
+def canonical_pathology_protocol(value: object) -> str:
+    """Standardize a small set of display-equivalent pathology labels."""
+    text = " ".join(str(value or "").strip().split())
+    key = text.casefold().replace("&", "and")
+    if key in {"h and e", "hematoxylin and eosin"}:
+        return "H&E"
+    if key in {"pdl1", "pd-l1"}:
+        return "PD-L1"
+    return text
+
+
+def canonical_pathology_magnification(value: object) -> str:
+    """Normalize magnification spelling while retaining its numeric value."""
+    text = " ".join(str(value or "").strip().split())
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*[x×]", text, flags=re.IGNORECASE)
+    if not match:
+        return text
+    number = match.group(1)
+    if "." in number:
+        number = number.rstrip("0").rstrip(".")
+    return f"{number}x"
 
 
 def canonicalize_patient_categories(frame: pd.DataFrame) -> pd.DataFrame:
@@ -726,6 +762,7 @@ def load_idc_patient_search_summary(
         "idc_collection_id",
         "idc_analysis_result_id",
         "dicom_series_idc",
+        "dicom_timepoints_idc",
         "dicom_modalities",
         "body_parts",
     ]
@@ -734,6 +771,7 @@ def load_idc_patient_search_summary(
         "analysis_result_id",
         "PatientID",
         "SeriesInstanceUID",
+        "StudyDate",
         "Modality",
         "BodyPartExamined",
     ]
@@ -752,10 +790,14 @@ def load_idc_patient_search_summary(
             "collection_id",
             "idc_analysis_result_id",
             "SeriesInstanceUID",
+            "StudyDate",
             "Modality",
             "BodyPartExamined",
         ]
     ].copy()
+    frame["StudyDate"] = (
+        frame["StudyDate"].fillna("").astype(str).str.strip().replace("", pd.NA)
+    )
     frame["subject_join_key"] = subject_join_keys(frame)
     frame = frame[frame["subject_join_key"] != ""]
     if frame.empty:
@@ -767,6 +809,7 @@ def load_idc_patient_search_summary(
             idc_collection_id=("collection_id", "first"),
             idc_analysis_result_id=("idc_analysis_result_id", "first"),
             dicom_series_idc=("SeriesInstanceUID", "nunique"),
+            dicom_timepoints_idc=("StudyDate", "nunique"),
             dicom_modalities=("Modality", join_tokens),
             body_parts=("BodyPartExamined", join_tokens),
         )
@@ -1094,6 +1137,17 @@ def _load_participant_search_index(path: Path | None) -> pd.DataFrame:
                group_concat(DISTINCT NULLIF(data_domain, '')) AS data_domains,
                group_concat(DISTINCT NULLIF(modality, '')) AS modalities,
                group_concat(DISTINCT NULLIF(file_format, '')) AS file_formats,
+               MAX(lower(COALESCE(data_domain, '')) = 'imaging_annotation'
+                   OR instr(lower(COALESCE(object_role, '')), 'segmentation') > 0
+                   OR lower(COALESCE(object_role, '')) = 'annotation_snapshot'
+                   OR (';' || replace(replace(upper(COALESCE(modality, '')), ' ', ''), ',', ';') || ';')
+                        LIKE '%;SEG;%'
+                   OR (';' || replace(replace(upper(COALESCE(modality, '')), ' ', ''), ',', ';') || ';')
+                        LIKE '%;RTSTRUCT;%'
+                   OR (';' || replace(replace(upper(COALESCE(modality, '')), ' ', ''), ',', ';') || ';')
+                        LIKE '%;SR;%'
+                   OR (';' || replace(replace(upper(COALESCE(modality, '')), ' ', ''), ',', ';') || ';')
+                        LIKE '%;ANN;%') AS has_annotations,
                MAX(access_level = 'controlled') AS has_controlled_metadata,
                MAX(access_level IN ('open', 'open_noncommercial')
                    AND managed_system = 'crdc_idc'
@@ -1130,7 +1184,7 @@ def _load_participant_search_index(path: Path | None) -> pd.DataFrame:
     result = participants.merge(asset_counts, on="participant_key", how="left")
     for column in (
         "has_open_data", "has_controlled_data", "has_public_dicom",
-        "has_public_non_dicom", "has_clinical",
+        "has_public_non_dicom", "has_clinical", "has_annotations",
     ):
         result[column] = pd.to_numeric(result.get(column), errors="coerce").fillna(0)
     for column in (
@@ -1157,7 +1211,8 @@ def enrich_participants_with_clinical_detail(
         "recurrence", "progression", "response", "screening_result",
         "days_to_death", "days_to_last_followup", "overall_survival_days",
         "progression_free_survival_days", "primary_diagnosis_value_role",
-        "primary_site_value_role", "source_kinds", "source_count", "conflict_count",
+        "primary_site_value_role", "primary_diagnosis_is_inferred",
+        "primary_site_is_inferred", "source_kinds", "source_count", "conflict_count",
         "clinical_subject_ids",
     ]
     if not path.exists():
@@ -1190,13 +1245,86 @@ def enrich_participants_with_clinical_detail(
     return result
 
 
+def load_participant_pathology_facets(path: Path | None) -> pd.DataFrame:
+    """Return additive participant-level pathology filter values from detail."""
+    columns = [
+        "short_title",
+        "subject_join_key",
+        "pathology_protocols",
+        "pathology_magnifications",
+    ]
+    source = (
+        preferred_object(path, "agent_public_non_dicom_image_metadata")
+        if path is not None
+        else None
+    )
+    if not source:
+        return pd.DataFrame(columns=columns)
+
+    def aggregate_field(
+        field: str,
+        output: str,
+        canonicalizer,
+    ) -> pd.DataFrame:
+        frame = read_sql(
+            path,
+            f"""
+            SELECT DISTINCT short_title, TRIM(subject_id) AS subject_id,
+                            TRIM({field}) AS value
+            FROM {source}
+            WHERE COALESCE(TRIM(subject_id), '') <> ''
+              AND COALESCE(TRIM({field}), '') <> ''
+            """,
+        )
+        if frame.empty:
+            return pd.DataFrame(columns=["short_title", "subject_join_key", output])
+        frame["subject_join_key"] = subject_join_keys(frame)
+        frame["value"] = frame["value"].map(canonicalizer)
+        frame = frame[
+            (frame["subject_join_key"] != "") & (frame["value"] != "")
+        ].drop_duplicates(["short_title", "subject_join_key", "value"])
+        return (
+            frame.groupby(["short_title", "subject_join_key"], sort=False)["value"]
+            .agg(
+                lambda values: json.dumps(
+                    sorted(set(values), key=str.casefold), separators=(",", ":")
+                )
+            )
+            .rename(output)
+            .reset_index()
+        )
+
+    protocols = aggregate_field(
+        "pathology_protocol", "pathology_protocols", canonical_pathology_protocol
+    )
+    magnifications = aggregate_field(
+        "magnification",
+        "pathology_magnifications",
+        canonical_pathology_magnification,
+    )
+    if protocols.empty:
+        result = magnifications
+    elif magnifications.empty:
+        result = protocols
+    else:
+        result = protocols.merge(
+            magnifications,
+            on=["short_title", "subject_join_key"],
+            how="outer",
+        )
+    for column in columns:
+        if column not in result:
+            result[column] = pd.NA
+    return result[columns]
+
+
 def build_patient_index(paths: DataPaths) -> pd.DataFrame:
     """Create one row per V2 dataset-scoped participant.
 
     The compact Participant Inventory is the primary search/summary source.
-    IDC contributes only participant-level DICOM BodyPartExamined filter values.
-    Clinical summaries are merged from the research-detail artifact that the
-    Participant Explorer prepares during startup.
+    IDC contributes narrow participant-level DICOM search enrichments. Clinical
+    summaries and pathology facets are merged additively from research-detail
+    artifacts that the Participant Explorer prepares during startup.
     """
     build_started = time.perf_counter()
     patients = _load_participant_search_index(paths.participant_db)
@@ -1205,6 +1333,20 @@ def build_patient_index(paths: DataPaths) -> pd.DataFrame:
             f"No V2 participant inventory found in {paths.participant_db}"
         )
     patients = enrich_participants_with_clinical_detail(patients, paths.clinical_db)
+    pathology_facets = load_participant_pathology_facets(
+        paths.public_non_dicom_db
+    )
+    if not pathology_facets.empty:
+        patients["subject_join_key"] = subject_join_keys(patients)
+        patients = patients.merge(
+            pathology_facets,
+            on=["short_title", "subject_join_key"],
+            how="left",
+            validate="many_to_one",
+        ).drop(columns="subject_join_key")
+    for column in ("pathology_protocols", "pathology_magnifications"):
+        if column not in patients:
+            patients[column] = pd.NA
     open_mask = patients["has_open_data"].astype(bool)
     controlled_mask = patients["has_controlled_data"].astype(bool)
     patients["resolved_access_level"] = "unknown"
@@ -1218,6 +1360,7 @@ def build_patient_index(paths: DataPaths) -> pd.DataFrame:
         ("MHA volumes", patients["mha_volumes"] > 0),
         ("NIfTI files", patients["nifti_files"] > 0),
         ("Pathology images", patients["pathology_images"] > 0),
+        ("Annotations / segmentations", patients["has_annotations"].astype(bool)),
         ("Clinical data", patients["has_clinical"].astype(bool)),
     ):
         separator = available.where(available == "", "; ")
@@ -1254,6 +1397,9 @@ def build_patient_index(paths: DataPaths) -> pd.DataFrame:
             ],
             axis=1,
         ).max(axis=1, skipna=True)
+        patients["dicom_timepoints"] = pd.to_numeric(
+            patients["dicom_timepoints_idc"], errors="coerce"
+        ).fillna(0)
         patients["modalities"] = patients.apply(
             lambda row: join_tokens(
                 [row.get("modalities"), row.get("dicom_modalities")]
@@ -1261,7 +1407,11 @@ def build_patient_index(paths: DataPaths) -> pd.DataFrame:
             axis=1,
         )
         patients = patients.drop(
-            columns=["dicom_series_idc", "dicom_modalities"]
+            columns=[
+                "dicom_series_idc",
+                "dicom_timepoints_idc",
+                "dicom_modalities",
+            ]
         )
 
     unlinked = read_sql(
@@ -1285,7 +1435,7 @@ def build_patient_index(paths: DataPaths) -> pd.DataFrame:
         ).drop(columns="_issue_subject_key")
 
     for column in (
-        "dicom_series", "public_dicom_files_outside_idc", "public_non_dicom_files",
+        "dicom_series", "dicom_timepoints", "public_dicom_files_outside_idc", "public_non_dicom_files",
         "ct_series", "mha_volumes", "nifti_files", "pathology_images", "controlled_files",
         "dataset_unlinked_asset_groups", "participant_link_issue_count",
     ):
@@ -1293,7 +1443,8 @@ def build_patient_index(paths: DataPaths) -> pd.DataFrame:
             patients[column] = 0
         patients[column] = pd.to_numeric(patients[column], errors="coerce").fillna(0).astype(int)
     for column in (
-        "has_public_dicom", "has_public_non_dicom", "has_clinical", "has_controlled_metadata"
+        "has_public_dicom", "has_public_non_dicom", "has_clinical",
+        "has_controlled_metadata", "has_annotations",
     ):
         if column not in patients:
             patients[column] = False
@@ -1307,15 +1458,21 @@ def build_patient_index(paths: DataPaths) -> pd.DataFrame:
     patients["has_nifti"] = patients["nifti_files"] > 0
     patients["has_pathdb"] = patients["pathology_images"] > 0
     patients["has_pathology_aspera"] = False
+    patients["has_multiple_imaging_dates"] = patients["dicom_timepoints"] >= 2
     patients["pathdb_slides"] = patients["pathology_images"]
-    diagnosis_role = patients.get(
-        "primary_diagnosis_value_role", pd.Series("", index=patients.index)
-    )
-    site_role = patients.get(
-        "primary_site_value_role", pd.Series("", index=patients.index)
-    )
-    patients["primary_diagnosis_is_inferred"] = diagnosis_role.eq("inferred")
-    patients["primary_site_is_inferred"] = site_role.eq("inferred")
+    for concept in ("primary_diagnosis", "primary_site"):
+        flag_column = f"{concept}_is_inferred"
+        role_column = f"{concept}_value_role"
+        inferred = pd.to_numeric(
+            patients.get(flag_column, pd.Series(pd.NA, index=patients.index)),
+            errors="coerce",
+        ).astype("boolean")
+        role_inferred = patients.get(
+            role_column, pd.Series("", index=patients.index)
+        ).fillna("").astype(str).str.casefold().eq("inferred")
+        patients[flag_column] = (
+            inferred.fillna(role_inferred).fillna(False).astype(bool)
+        )
     patients["has_any_imaging"] = patients[
         ["has_public_dicom", "has_public_non_dicom", "has_controlled_metadata"]
     ].any(axis=1)
@@ -1483,15 +1640,22 @@ def build_grouped_patient_index(
             "available_imaging",
             "modalities",
             "body_parts",
+            "file_formats",
             "source_kinds",
         ):
             if column in group:
                 combined[column] = join_tokens(group[column].tolist())
         for column in (
+            "pathology_protocols",
+            "pathology_magnifications",
+        ):
+            if column in group:
+                combined[column] = join_token_json(group[column].tolist())
+        for column in (
             "dicom_series",
+            "dicom_timepoints",
             "public_non_dicom_files",
             "dicom_studies",
-            "dicom_timepoints",
             "nifti_files",
             "nifti_studies",
             "nifti_timepoints",
@@ -1517,6 +1681,8 @@ def build_grouped_patient_index(
             "has_controlled_metadata",
             "has_pathology_aspera",
             "has_any_imaging",
+            "has_annotations",
+            "has_multiple_imaging_dates",
         ):
             if column in group:
                 combined[column] = bool(

@@ -35,6 +35,7 @@ from cohort_builder_data import (
     load_patient_clinical_longitudinal,
     load_patient_nifti_packages,
     load_patient_public_non_dicom,
+    load_participant_pathology_facets,
     load_public_non_dicom_image_metadata,
     load_public_non_dicom_locations,
     normalize_dataset_key,
@@ -77,12 +78,17 @@ class CohortBuilderDataTests(unittest.TestCase):
                 connection.execute(
                     "CREATE TABLE agent_clinical_all_subjects ("
                     "short_title TEXT, subject_id TEXT, primary_diagnosis TEXT, "
+                    "primary_diagnosis_is_inferred INTEGER, "
+                    "primary_site_is_inferred INTEGER, "
                     "has_imaging INTEGER, source_count INTEGER, conflict_count INTEGER, "
                     "source_kinds TEXT)"
                 )
                 connection.execute(
-                    "INSERT INTO agent_clinical_all_subjects VALUES (?,?,?,?,?,?,?)",
-                    ("TEST", "p-01", "Resolved diagnosis", 1, 1, 0, '[\"clinical\"]'),
+                    "INSERT INTO agent_clinical_all_subjects VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        "TEST", "p-01", "Resolved diagnosis", 1, 0,
+                        1, 1, 0, '[\"clinical\"]',
+                    ),
                 )
             participants = pd.DataFrame(
                 [{"short_title": "TEST", "subject_id": "P-01"}]
@@ -99,6 +105,9 @@ class CohortBuilderDataTests(unittest.TestCase):
             self.assertEqual(
                 enriched.iloc[0]["primary_diagnosis"], "Resolved diagnosis"
             )
+            self.assertEqual(
+                int(enriched.iloc[0]["primary_diagnosis_is_inferred"]), 1
+            )
 
     def test_idc_search_summary_is_aggregated_by_dataset_scoped_participant(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -110,6 +119,7 @@ class CohortBuilderDataTests(unittest.TestCase):
                         "analysis_result_id": "",
                         "PatientID": "P1",
                         "SeriesInstanceUID": "1",
+                        "StudyDate": "20200101",
                         "Modality": "CT",
                         "BodyPartExamined": "CHEST",
                     },
@@ -118,6 +128,7 @@ class CohortBuilderDataTests(unittest.TestCase):
                         "analysis_result_id": "",
                         "PatientID": "P1",
                         "SeriesInstanceUID": "2",
+                        "StudyDate": "20210101",
                         "Modality": "SEG",
                         "BodyPartExamined": "ABDOMEN",
                     },
@@ -126,6 +137,7 @@ class CohortBuilderDataTests(unittest.TestCase):
                         "analysis_result_id": "",
                         "PatientID": "P2",
                         "SeriesInstanceUID": "3",
+                        "StudyDate": "",
                         "Modality": "MR",
                         "BodyPartExamined": None,
                     },
@@ -141,8 +153,42 @@ class CohortBuilderDataTests(unittest.TestCase):
             p1 = result[result["subject_join_key"] == "p1"].iloc[0]
             self.assertEqual(p1["short_title"], "TEST")
             self.assertEqual(int(p1["dicom_series_idc"]), 2)
+            self.assertEqual(int(p1["dicom_timepoints_idc"]), 2)
             self.assertEqual(p1["dicom_modalities"], "CT; SEG")
             self.assertEqual(p1["body_parts"], "ABDOMEN; CHEST")
+
+    def test_participant_pathology_facets_are_standardized_and_json_encoded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "public.sqlite"
+            with sqlite3.connect(path) as connection:
+                connection.execute(
+                    "CREATE TABLE agent_public_non_dicom_image_metadata ("
+                    "short_title TEXT, subject_id TEXT, pathology_protocol TEXT, "
+                    "magnification TEXT)"
+                )
+                connection.executemany(
+                    "INSERT INTO agent_public_non_dicom_image_metadata VALUES (?,?,?,?)",
+                    [
+                        ("TEST", "P1", "Hematoxylin and eosin", "40X"),
+                        ("TEST", "p1", "H&E", "40x"),
+                        ("TEST", "P1", "Multiplex assay, panel A", "20 x"),
+                        ("TEST", "", "H&E", "10x"),
+                    ],
+                )
+
+            result = load_participant_pathology_facets(path)
+
+            self.assertEqual(len(result), 1)
+            row = result.iloc[0]
+            self.assertEqual(row["subject_join_key"], "p1")
+            self.assertEqual(
+                json.loads(row["pathology_protocols"]),
+                ["H&E", "Multiplex assay, panel A"],
+            )
+            self.assertEqual(
+                json.loads(row["pathology_magnifications"]),
+                ["20x", "40x"],
+            )
 
     def test_dataset_aspera_packages_are_public_wordpress_routes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -266,7 +312,7 @@ class CohortBuilderDataTests(unittest.TestCase):
                     "INSERT INTO agent_participant_assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     [
                         ("a1", "pk1", "crdc_idc", "idc", "open", "radiology", "image_series", "CT", "DICOM", "source_image", 1, 2, 20, 100, 1, "idc", "view", "known", "v1", "{}"),
-                        ("a2", "pk1", "tcia_wordpress", "public_non_dicom_metadata", "open", "radiology", "image_volume", "CT", "MHA", "standardized_image", 1, 0, 1, 50, 1, "pnd", "download", "known", "v3", "{}"),
+                        ("a2", "pk1", "tcia_wordpress", "public_non_dicom_metadata", "open", "radiology", "image_volume", "CT", "MHA", "source_image,segmentation", 1, 0, 1, 50, 1, "pnd", "download", "known", "v3", "{}"),
                         ("a3", "pk1", "crdc_gc", "controlled_access_metadata", "controlled", "radiology", "image_series", "CT", "DICOM", "submitted_original", 1, 1, 5, 80, 1, "controlled", "request", "known", "v2", "{}"),
                         ("a4", "pk1", "tcia_aspera", "public_non_dicom_metadata", "open", "radiology", "participant_modality", "MR", "DICOM", "submitted_original", 0, 0, 400, 0, 0, "pnd", "download", "known", "v6", "{}"),
                     ],
@@ -289,8 +335,29 @@ class CohortBuilderDataTests(unittest.TestCase):
                     "CREATE TABLE agent_participant_link_issues (short_title TEXT, raw_identifier TEXT)"
                 )
 
+            clinical_db = root / "clinical.sqlite"
+            with sqlite3.connect(clinical_db) as connection:
+                connection.execute(
+                    "CREATE TABLE agent_clinical_all_subjects ("
+                    "short_title TEXT, subject_id TEXT, primary_diagnosis TEXT, "
+                    "primary_diagnosis_is_inferred INTEGER, "
+                    "primary_site_is_inferred INTEGER)"
+                )
+                connection.execute(
+                    "INSERT INTO agent_clinical_all_subjects VALUES (?,?,?,?,?)",
+                    ("TEST", "P1", "Dataset diagnosis", 1, 0),
+                )
+
             empty = root / "missing.sqlite"
-            paths = DataPaths(empty, empty, empty, empty, empty, empty, participant_db=participant_db)
+            paths = DataPaths(
+                empty,
+                clinical_db,
+                empty,
+                empty,
+                empty,
+                empty,
+                participant_db=participant_db,
+            )
             result = build_patient_index(paths)
 
             self.assertEqual(len(result), 1)
@@ -303,7 +370,10 @@ class CohortBuilderDataTests(unittest.TestCase):
             self.assertEqual(int(row["controlled_files"]), 5)
             self.assertEqual(int(row["mha_volumes"]), 1)
             self.assertEqual(row["resolved_access_level"], "mixed")
-            self.assertTrue(pd.isna(row["primary_diagnosis"]))
+            self.assertEqual(row["primary_diagnosis"], "Dataset diagnosis")
+            self.assertTrue(bool(row["primary_diagnosis_is_inferred"]))
+            self.assertTrue(bool(row["has_annotations"]))
+            self.assertIn("MHA", row["file_formats"])
             self.assertEqual(
                 row["identity_resolution_method"],
                 "casefolded_identifier_same_tcia_dataset",

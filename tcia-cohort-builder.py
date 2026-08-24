@@ -56,7 +56,7 @@ from v2_artifacts import (
 )
 
 
-PATIENT_INDEX_SCHEMA_VERSION = 12
+PATIENT_INDEX_SCHEMA_VERSION = 13
 APP_DIR = Path(__file__).resolve().parent
 BRAND_SKILL_DIR = Path.home() / ".codex" / "skills" / "tcia-brand-guidelines"
 LOGO_PATH = BRAND_SKILL_DIR / "assets" / "tcia-logo-dark.svg"
@@ -64,6 +64,7 @@ OFFICIAL_LOGO_URL = (
     "https://www.cancerimagingarchive.net/wp-content/uploads/2021/06/"
     "TCIA-Logo-01.svg"
 )
+PATIENT_RESULTS_PAGE_SIZES = (25, 50, 100, 250)
 
 
 st.set_page_config(
@@ -303,14 +304,25 @@ def clear_filters() -> None:
         "draft_imaging",
         "draft_modalities",
         "draft_body_parts",
+        "draft_file_formats",
+        "draft_pathology_protocols",
+        "draft_pathology_magnifications",
         "draft_diagnosis",
         "draft_site",
         "draft_sex",
         "draft_vital",
     ):
         st.session_state[key] = []
+    st.session_state["draft_age_at_imaging"] = (0, 120)
+    st.session_state["draft_multiple_imaging_dates"] = False
+    st.session_state["draft_include_inferred_clinical"] = True
     st.session_state["draft_conflicts"] = False
+    st.session_state["patient_results_page"] = 1
     st.session_state.pop("selected_patient_key", None)
+
+
+def reset_patient_results_page() -> None:
+    st.session_state["patient_results_page"] = 1
 
 
 def render_brand_and_cart() -> None:
@@ -1414,7 +1426,14 @@ def main() -> None:
     access = f3.multiselect("Access", option_values(patients, "resolved_access_level"), format_func=access_label, key="draft_access")
     imaging = f4.multiselect(
         "Available data",
-        ["Public DICOM", "MHA volumes", "NIfTI files", "Pathology images", "Clinical data"],
+        [
+            "Public DICOM",
+            "MHA volumes",
+            "NIfTI files",
+            "Pathology images",
+            "Annotations / segmentations",
+            "Clinical data",
+        ],
         key="draft_imaging",
     )
 
@@ -1444,6 +1463,7 @@ def main() -> None:
             "MHA volumes": "mha_volumes",
             "NIfTI files": "has_nifti",
             "Pathology images": "has_pathdb",
+            "Annotations / segmentations": "has_annotations",
             "Clinical data": "has_clinical",
         }
         mask = pd.Series(False, index=working.index)
@@ -1452,8 +1472,13 @@ def main() -> None:
         working = working[mask]
 
     with st.expander("Advanced clinical and imaging filters", expanded=False):
+        st.markdown("**Imaging**")
         a1, a2, a3 = st.columns(3)
-        modalities = a1.multiselect("Modality", token_options(working, "modalities"), key="draft_modalities")
+        modalities = a1.multiselect(
+            "Modality",
+            token_options(working, "modalities"),
+            key="draft_modalities",
+        )
         working = apply_token_filter(working, "modalities", modalities)
         body_parts = a2.multiselect(
             "Body part",
@@ -1466,18 +1491,105 @@ def main() -> None:
             ),
         )
         working = apply_token_filter(working, "body_parts", body_parts)
+        file_formats = a3.multiselect(
+            "File format",
+            token_options(working, "file_formats"),
+            key="draft_file_formats",
+            help="Format reflects participant-linked inventory such as DICOM, NIfTI, SVS, MHA, or NRRD.",
+        )
+        working = apply_token_filter(working, "file_formats", file_formats)
+
+        multiple_imaging_dates = st.toggle(
+            "Multiple imaging dates",
+            key="draft_multiple_imaging_dates",
+            help=(
+                "Keep patients with public DICOM on at least two distinct IDC StudyDate values. "
+                "Distinct dates are an imaging-time-point proxy, not a curated visit definition."
+            ),
+        )
+        if multiple_imaging_dates:
+            working = working[
+                working["has_multiple_imaging_dates"].fillna(False).astype(bool)
+            ]
+
+        pathology_values: dict[str, list[str]] = {}
+        if "Pathology images" in imaging:
+            st.markdown("**Pathology**")
+            p1, p2 = st.columns(2)
+            pathology_filters = [
+                (
+                    p1,
+                    "Protocol or stain",
+                    "pathology_protocols",
+                    "draft_pathology_protocols",
+                ),
+                (
+                    p2,
+                    "Magnification",
+                    "pathology_magnifications",
+                    "draft_pathology_magnifications",
+                ),
+            ]
+            for container, label, column, key in pathology_filters:
+                selected = container.multiselect(
+                    label,
+                    token_options(working, column),
+                    key=key,
+                    help=(
+                        "Participant-linked public non-DICOM metadata only; "
+                        "dataset-level files without a patient crosswalk are not assigned."
+                    ),
+                )
+                pathology_values[column] = selected
+                working = apply_token_filter(working, column, selected)
+
+        st.markdown("**Clinical**")
         clinical_values: dict[str, list[str]] = {}
+        age_at_imaging_range = (0, 120)
+        include_inferred_clinical = True
         if not paths.clinical_db.exists():
-            a3.caption("Startup preparation did not provide clinical detail.")
+            st.caption("Startup preparation did not provide clinical detail.")
             render_detail_install_notice(
                 "Clinical detail is required for diagnosis, site, sex-at-birth, and "
                 "vital-status filters. Participant search remains available from the core inventory."
             )
         else:
-            a3.caption(
+            st.caption(
                 "Clinical filters use the installed detail artifact; raw and alternate "
                 "values remain available in participant provenance."
             )
+            clinical_settings, age_control = st.columns([1, 2])
+            include_inferred_clinical = clinical_settings.toggle(
+                "Include dataset-inferred diagnosis and site",
+                value=True,
+                key="draft_include_inferred_clinical",
+                help=(
+                    "When disabled, diagnosis and site choices use patient-level or "
+                    "patient-inherited evidence only. Other patients remain visible unless "
+                    "a diagnosis or site value is selected."
+                ),
+            )
+            age_at_imaging_range = age_control.slider(
+                "Earliest recorded age at imaging",
+                min_value=0,
+                max_value=120,
+                value=(0, 120),
+                step=1,
+                format="%d years",
+                key="draft_age_at_imaging",
+                help=(
+                    "Uses the earliest accepted age-at-imaging value. Changing the full "
+                    "range excludes patients whose imaging age is unavailable."
+                ),
+            )
+            if age_at_imaging_range != (0, 120):
+                ages = pd.to_numeric(
+                    working["age_at_imaging_years"], errors="coerce"
+                )
+                working = working[
+                    ages.between(*age_at_imaging_range, inclusive="both")
+                ]
+
             c1, c2, c3, c4 = st.columns(4)
             clinical_filters = [
                 (c1, "Primary diagnosis", "primary_diagnosis", "draft_diagnosis"),
@@ -1486,12 +1598,29 @@ def main() -> None:
                 (c4, "Vital status", "vital_status", "draft_vital"),
             ]
             for container, label, column, key in clinical_filters:
+                option_frame = working
+                inference_column = f"{column}_is_inferred"
+                if (
+                    not include_inferred_clinical
+                    and inference_column in working
+                ):
+                    option_frame = working[
+                        ~working[inference_column].fillna(False).astype(bool)
+                    ]
                 selected = container.multiselect(
-                    label, option_values(working, column), key=key
+                    label, option_values(option_frame, column), key=key
                 )
                 clinical_values[column] = selected
                 if selected:
-                    working = working[working[column].isin(selected)]
+                    selected_mask = working[column].isin(selected)
+                    if (
+                        not include_inferred_clinical
+                        and inference_column in working
+                    ):
+                        selected_mask &= ~working[inference_column].fillna(
+                            False
+                        ).astype(bool)
+                    working = working[selected_mask]
 
     reset_col, count_col = st.columns([.18, .82], vertical_alignment="center")
     reset_col.button("Clear filters", on_click=clear_filters, width="stretch")
@@ -1515,6 +1644,31 @@ def main() -> None:
             ("Imaging", imaging),
             ("Modality", modalities),
             ("Body part", body_parts),
+            ("File format", file_formats),
+            (
+                "Imaging dates",
+                "Multiple dates" if multiple_imaging_dates else "",
+            ),
+            (
+                "Pathology protocol",
+                pathology_values.get("pathology_protocols", []),
+            ),
+            (
+                "Pathology magnification",
+                pathology_values.get("pathology_magnifications", []),
+            ),
+            (
+                "Imaging age",
+                (
+                    f"{age_at_imaging_range[0]}–{age_at_imaging_range[1]} years"
+                    if age_at_imaging_range != (0, 120)
+                    else ""
+                ),
+            ),
+            (
+                "Clinical evidence",
+                "Patient-level only" if not include_inferred_clinical else "",
+            ),
             ("Diagnosis", clinical_values.get("primary_diagnosis", [])),
             ("Site", clinical_values.get("primary_site", [])),
             ("Sex", clinical_values.get("sex_at_birth", [])),
@@ -1538,12 +1692,64 @@ def main() -> None:
         body_parts,
     )
 
-    results_col, detail_col = st.columns([1.45, 1], gap="large")
-    with results_col:
+    with st.container():
         st.markdown("<div class='section-label'>Patient results</div>", unsafe_allow_html=True)
         if working.empty:
             st.info("No patients match these filters. Remove a filter to broaden the cohort.")
         else:
+            result_filter_signature = (
+                str(dataset_type),
+                search.casefold(),
+                tuple(datasets),
+                tuple(access),
+                tuple(imaging),
+                tuple(modalities),
+                tuple(body_parts),
+                tuple(file_formats),
+                bool(multiple_imaging_dates),
+                tuple(pathology_values.get("pathology_protocols", [])),
+                tuple(pathology_values.get("pathology_magnifications", [])),
+                tuple(age_at_imaging_range),
+                bool(include_inferred_clinical),
+                tuple(clinical_values.get("primary_diagnosis", [])),
+                tuple(clinical_values.get("primary_site", [])),
+                tuple(clinical_values.get("sex_at_birth", [])),
+                tuple(clinical_values.get("vital_status", [])),
+            )
+            if (
+                st.session_state.get("_patient_results_filter_signature")
+                != result_filter_signature
+            ):
+                st.session_state["_patient_results_filter_signature"] = (
+                    result_filter_signature
+                )
+                reset_patient_results_page()
+
+            st.session_state.setdefault("patient_results_page_size", 50)
+            page_size = int(st.session_state["patient_results_page_size"])
+            total_pages = max(1, (len(working) + page_size - 1) // page_size)
+            current_page = min(
+                max(1, int(st.session_state.get("patient_results_page", 1))),
+                total_pages,
+            )
+            st.session_state["patient_results_page"] = current_page
+
+            page_col, size_col = st.columns(2, vertical_alignment="bottom")
+            page_col.number_input(
+                "Page",
+                min_value=1,
+                max_value=total_pages,
+                step=1,
+                key="patient_results_page",
+                help="Jump directly to any page in the complete result set.",
+            )
+            size_col.selectbox(
+                "Rows per page",
+                PATIENT_RESULTS_PAGE_SIZES,
+                key="patient_results_page_size",
+                on_change=reset_patient_results_page,
+            )
+
             display_columns = [
                 column
                 for column in (
@@ -1564,9 +1770,11 @@ def main() -> None:
                 )
                 if column in working
             ]
-            page_size = min(50, len(working))
+            page_start = (current_page - 1) * page_size
+            page_end = min(page_start + page_size, len(working))
+            page_frame = working.iloc[page_start:page_end]
             result = st.dataframe(
-                working[display_columns].head(page_size),
+                page_frame[display_columns],
                 hide_index=True,
                 width="stretch",
                 height=560,
@@ -1604,23 +1812,32 @@ def main() -> None:
                     ),
                 },
             )
-            st.caption(f"Showing the first {page_size:,} matches. Select one row to inspect it alongside the cohort.")
             if result.selection.rows:
-                selected_index = working.index[result.selection.rows[0]]
+                selected_index = page_frame.index[result.selection.rows[0]]
                 st.session_state.selected_patient_key = working.loc[selected_index, "patient_key"]
+            selected_result_key = st.session_state.get("selected_patient_key")
+            selected_result = working[
+                working["patient_key"] == selected_result_key
+            ]
+            selection_guidance = (
+                f"Selected patient {selected_result.iloc[0]['subject_id']}; details appear below."
+                if not selected_result.empty
+                else "Select one row to inspect its details below the results."
+            )
+            st.caption(
+                f"Showing {page_start + 1:,}–{page_end:,} of {len(working):,} matches "
+                f"· Page {current_page:,} of {total_pages:,}. {selection_guidance}"
+            )
 
-    with detail_col:
+    with st.container():
         selected_key = st.session_state.get("selected_patient_key")
         selected = patients[patients["patient_key"] == selected_key]
         visible_keys = set(working["patient_key"].tolist()) if not working.empty else set()
         if selected.empty or selected_key not in visible_keys:
             if selected_key not in visible_keys:
                 st.session_state.pop("selected_patient_key", None)
-            st.markdown(
-                '<div class="empty-detail"><strong>Select a patient</strong><br>Clinical provenance, imaging time points, viewers, and retrieval routes will appear here.</div>',
-                unsafe_allow_html=True,
-            )
         else:
+            st.divider()
             selected_members = membership_rows[
                 membership_rows["patient_group_key"] == selected_key
             ].copy()
