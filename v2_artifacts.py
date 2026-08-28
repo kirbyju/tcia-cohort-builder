@@ -25,11 +25,14 @@ INSTALL_STATE_ASSET = "tcia_metadata_v2_install.json"
 BUNDLE_SCHEMA_VERSION = 2
 SUPPORTED_RELEASE_CONTRACTS = {"full", "streamlined"}
 SUPPORTED_COMPONENTS = {
-    "snapshot": {"schema_version": 7, "profile": "research_core"},
-    "participant_inventory": {"schema_version": 6, "profile": "research_core"},
-    "public_non_dicom": {"schema_version": 7, "profile": "research_detail"},
-    "controlled_access": {"schema_version": 2, "profile": "research_detail"},
-    "clinical": {"schema_version": 17, "profile": "research_detail"},
+    "snapshot": {"schema_versions": {7}, "profile": "research_core"},
+    "participant_inventory": {
+        "schema_versions": {6, 7},
+        "profile": "research_core",
+    },
+    "public_non_dicom": {"schema_versions": {7, 8}, "profile": "research_detail"},
+    "controlled_access": {"schema_versions": {2}, "profile": "research_detail"},
+    "clinical": {"schema_versions": {17}, "profile": "research_detail"},
 }
 SUPPORTED_INSTALL_PROFILES = {"research_core", "research_detail", "audit_support"}
 PROFILE_COMPONENTS = {
@@ -199,9 +202,12 @@ def _validate_bundle_manifest(payload: dict[str, Any]) -> None:
 
 def _validate_component_contract(name: str, component: dict[str, Any]) -> None:
     expected = SUPPORTED_COMPONENTS[name]
-    if component.get("schema_version") != expected["schema_version"]:
+    if component.get("schema_version") not in expected["schema_versions"]:
+        supported = ", ".join(
+            str(value) for value in sorted(expected["schema_versions"])
+        )
         raise RuntimeError(
-            f"Unsupported {name} schema: expected {expected['schema_version']}, "
+            f"Unsupported {name} schema: expected one of {supported}, "
             f"got {component.get('schema_version')}"
         )
     if component.get("profile") != expected["profile"]:
