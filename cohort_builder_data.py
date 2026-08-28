@@ -78,9 +78,12 @@ COHORT_EXPORT_COLUMNS = (
     "conflict_count",
     "has_clinical",
     "available_imaging",
+    "data_categories",
+    "data_types",
     "modalities",
     "body_parts",
     "file_formats",
+    "geometry_statuses",
     "has_annotations",
     "dicom_series",
     "dicom_timepoints",
@@ -376,6 +379,54 @@ def join_tokens(values: Iterable[object]) -> str:
     for value in values:
         tokens.update(split_tokens(value))
     return "; ".join(sorted(tokens, key=str.casefold))
+
+
+def participant_data_categories(row: Mapping[str, object]) -> str:
+    """Return broad WordPress-aligned categories, with schema-6 fallback."""
+    current = split_tokens(row.get("data_categories"))
+    if current:
+        return join_tokens(current)
+    domains = {value.casefold() for value in split_tokens(row.get("data_domains"))}
+    values: list[str] = []
+    if "imaging_annotation" in domains or bool(row.get("has_annotations", False)):
+        values.append("Annotations/Segmentations")
+    values.extend(
+        label
+        for token, label in (
+            ("radiology", "Radiology"),
+            ("pathology", "Pathology"),
+            ("clinical", "Clinical Data"),
+            ("other_imaging", "Other Imaging"),
+            ("endoscopy", "Other Imaging"),
+        )
+        if token in domains
+    )
+    return join_tokens(values)
+
+
+def participant_data_types(row: Mapping[str, object]) -> str:
+    """Return specific content/modality types, with schema-6 fallback."""
+    current = split_tokens(row.get("data_types"))
+    values = current + split_tokens(row.get("modalities"))
+    media_labels = {
+        "whole_slide_image": "Whole Slide Image",
+        "still_image": "Still Image",
+        "video": "Video",
+        "spectral_or_array": "Spectral/Array Data",
+        "tabular": "Tabular Data",
+    }
+    values.extend(
+        media_labels[token.casefold()]
+        for token in split_tokens(row.get("media_kinds"))
+        if token.casefold() in media_labels
+    )
+    if bool(row.get("has_annotations", False)):
+        values.append("Annotation/Segmentation")
+    if "clinical data" in {
+        token.casefold() for token in split_tokens(participant_data_categories(row))
+    }:
+        values.append("Clinical Data")
+    return join_tokens(values)
 
 
 def join_token_json(values: Iterable[object]) -> str:
@@ -1045,6 +1096,9 @@ def participant_availability_rows(
             return 0
 
     unlinked = count("dataset_unlinked_asset_groups")
+    geometry_checked = count("geometry_checked_count")
+    geometry_not_checked = count("geometry_not_checked_count")
+    geometry_statuses = ", ".join(split_tokens(participant.get("geometry_statuses")))
     public_non_dicom = enabled("has_public_non_dicom")
     if public_non_dicom and unlinked:
         non_dicom_state = "Participant linked; dataset also has unlinked asset groups"
@@ -1092,6 +1146,22 @@ def participant_availability_rows(
             ),
             "Detail": "Authorization is required for controlled payloads.",
         },
+        {
+            "Data": "Geometry assessment",
+            "Coverage": (
+                f"{geometry_checked:,} checked unit{'s' if geometry_checked != 1 else ''}"
+                if geometry_checked
+                else "Not checked"
+            ),
+            "Detail": (
+                geometry_statuses
+                or (
+                    f"{geometry_not_checked:,} eligible asset{'s' if geometry_not_checked != 1 else ''} not checked."
+                    if geometry_not_checked
+                    else "No geometry assessment status is represented."
+                )
+            ),
+        },
     ]
 
 
@@ -1118,9 +1188,40 @@ def _load_participant_search_index(path: Path | None) -> pd.DataFrame:
     # here because materializing its correlated namespace columns adds tens of
     # seconds to a cold Streamlit startup. A future schema cannot silently use
     # these predicates: it is rejected before this query runs.
+    asset_columns = set(
+        read_sql(
+            path,
+            "SELECT name FROM pragma_table_info('agent_participant_assets')",
+        ).get("name", pd.Series(dtype=str)).astype(str)
+    )
+    data_categories_sql = (
+        "group_concat(DISTINCT NULLIF(data_category, ''))"
+        if "data_category" in asset_columns
+        else "''"
+    )
+    data_types_sql = (
+        "group_concat(DISTINCT NULLIF(data_type, ''))"
+        if "data_type" in asset_columns
+        else "''"
+    )
+    geometry_statuses_sql = (
+        "group_concat(DISTINCT NULLIF(geometry_status, ''))"
+        if "geometry_status" in asset_columns
+        else "''"
+    )
+    geometry_count_sql = (
+        "SUM(COALESCE(geometry_checked_count, 0))"
+        if "geometry_checked_count" in asset_columns
+        else "0"
+    )
+    geometry_not_checked_sql = (
+        "SUM(COALESCE(geometry_not_checked_count, 0))"
+        if "geometry_not_checked_count" in asset_columns
+        else "0"
+    )
     asset_counts = read_sql(
         path,
-        """
+        f"""
         SELECT participant_key,
                COUNT(DISTINCT participant_asset_id) AS inventory_rows,
                MAX(access_level = 'open') AS has_open_data,
@@ -1135,8 +1236,14 @@ def _load_participant_search_index(path: Path | None) -> pd.DataFrame:
                  AS has_public_non_dicom,
                MAX(data_domain = 'clinical') AS has_clinical,
                group_concat(DISTINCT NULLIF(data_domain, '')) AS data_domains,
+               {data_categories_sql} AS data_categories,
+               {data_types_sql} AS data_types,
+               group_concat(DISTINCT NULLIF(media_kind, '')) AS media_kinds,
                group_concat(DISTINCT NULLIF(modality, '')) AS modalities,
                group_concat(DISTINCT NULLIF(file_format, '')) AS file_formats,
+               {geometry_statuses_sql} AS geometry_statuses,
+               {geometry_count_sql} AS geometry_checked_count,
+               {geometry_not_checked_sql} AS geometry_not_checked_count,
                MAX(lower(COALESCE(data_domain, '')) = 'imaging_annotation'
                    OR instr(lower(COALESCE(object_role, '')), 'segmentation') > 0
                    OR lower(COALESCE(object_role, '')) = 'annotation_snapshot'
@@ -1195,6 +1302,8 @@ def _load_participant_search_index(path: Path | None) -> pd.DataFrame:
     result["has_idc_dicom_metadata"] = pd.to_numeric(
         result.get("has_idc_dicom_metadata"), errors="coerce"
     ).fillna(0)
+    result["data_categories"] = result.apply(participant_data_categories, axis=1)
+    result["data_types"] = result.apply(participant_data_types, axis=1)
     return result
 
 
@@ -1437,6 +1546,7 @@ def build_patient_index(paths: DataPaths) -> pd.DataFrame:
     for column in (
         "dicom_series", "dicom_timepoints", "public_dicom_files_outside_idc", "public_non_dicom_files",
         "ct_series", "mha_volumes", "nifti_files", "pathology_images", "controlled_files",
+        "geometry_checked_count", "geometry_not_checked_count",
         "dataset_unlinked_asset_groups", "participant_link_issue_count",
     ):
         if column not in patients:
@@ -1500,6 +1610,10 @@ def build_patient_index(paths: DataPaths) -> pd.DataFrame:
     if "body_parts" not in patients:
         patients["body_parts"] = ""
     patients["body_parts"] = patients["body_parts"].fillna("")
+    patients["data_categories"] = patients.apply(
+        participant_data_categories, axis=1
+    )
+    patients["data_types"] = patients.apply(participant_data_types, axis=1)
     patients = canonicalize_patient_categories(patients)
     patients = patients.sort_values(
         ["short_title", "subject_id"], key=lambda series: series.astype(str).str.casefold()
@@ -1638,9 +1752,12 @@ def build_grouped_patient_index(
 
         for column in (
             "available_imaging",
+            "data_categories",
+            "data_types",
             "modalities",
             "body_parts",
             "file_formats",
+            "geometry_statuses",
             "source_kinds",
         ):
             if column in group:
@@ -1664,6 +1781,8 @@ def build_grouped_patient_index(
             "controlled_files",
             "controlled_series",
             "controlled_studies",
+            "geometry_checked_count",
+            "geometry_not_checked_count",
             "controlled_timepoints",
             "conflict_count",
             "source_count",
@@ -2565,6 +2684,7 @@ def collect_filtered_imaging_routes(
     *,
     imaging_sources: Sequence[str] = (),
     modalities: Sequence[str] = (),
+    data_types: Sequence[str] = (),
     body_parts: Sequence[str] = (),
     direct_collection_titles: Sequence[str] = (),
 ) -> tuple[dict[str, list[str]], pd.DataFrame]:
@@ -2575,23 +2695,125 @@ def collect_filtered_imaging_routes(
         return routes, pd.DataFrame()
 
     source_aliases = {
-        "DICOM series": "IDC DICOM",
-        "Public DICOM": "IDC DICOM",
-        "MHA volumes": "Public non-DICOM",
-        "NIfTI files": "Public non-DICOM",
-        "Pathology images": "Public non-DICOM",
-        "Controlled access": "Controlled-access file metadata",
+        "DICOM series": ("IDC DICOM",),
+        "Public DICOM": ("IDC DICOM",),
+        "MHA volumes": ("Public non-DICOM",),
+        "NIfTI files": ("Public non-DICOM",),
+        "Pathology images": ("Public non-DICOM",),
+        "Controlled access": ("Controlled-access file metadata",),
+        "Radiology": ("IDC DICOM", "Public non-DICOM"),
+        "Pathology": ("IDC DICOM", "Public non-DICOM"),
+        "Annotations/Segmentations": ("IDC DICOM", "Public non-DICOM"),
+        "Other Imaging": ("Public non-DICOM",),
+        "Clinical Data": (),
     }
-    requested = {source_aliases.get(value, value) for value in imaging_sources} or {
-        "IDC DICOM",
-        "Public non-DICOM",
-        "Controlled-access file metadata",
-    }
+    if imaging_sources:
+        requested = {
+            source
+            for value in imaging_sources
+            for source in source_aliases.get(value, (value,))
+        }
+    else:
+        requested = {
+            "IDC DICOM",
+            "Public non-DICOM",
+            "Controlled-access file metadata",
+        }
     short_titles = sorted(set(patients["short_title"].dropna().astype(str)))
 
     def filter_rows(frame: pd.DataFrame) -> pd.DataFrame:
         matched = _match_export_rows_to_patients(frame, patients)
+        category_labels = {
+            "radiology",
+            "pathology",
+            "annotations/segmentations",
+            "clinical data",
+            "other imaging",
+        }
+        wanted_categories = {
+            str(value).casefold()
+            for value in imaging_sources
+            if str(value).casefold() in category_labels
+        }
+        if wanted_categories and not matched.empty:
+            annotation_modalities = {"ANN", "KO", "PR", "RTSTRUCT", "SEG", "SR"}
+
+            def matches_category(row: pd.Series) -> bool:
+                domains = {
+                    value.casefold()
+                    for value in split_tokens(row.get("imaging_domain"))
+                }
+                modalities_in_row = {
+                    value.upper() for value in split_tokens(row.get("modality"))
+                }
+                roles = {
+                    value.casefold() for value in split_tokens(row.get("object_role"))
+                }
+                media = {
+                    value.casefold() for value in split_tokens(row.get("media_kind"))
+                }
+                categories: set[str] = set()
+                if domains & {"radiology"} or modalities_in_row - {"SM"}:
+                    categories.add("radiology")
+                if "pathology" in domains or "SM" in modalities_in_row:
+                    categories.add("pathology")
+                if (
+                    "imaging_annotation" in domains
+                    or modalities_in_row & annotation_modalities
+                    or roles & {
+                        "annotation",
+                        "annotation_snapshot",
+                        "aim_segmentation_annotation",
+                        "segmentation",
+                    }
+                ):
+                    categories.add("annotations/segmentations")
+                if domains & {"endoscopy", "other_imaging"} or "video" in media:
+                    categories.add("other imaging")
+                return bool(categories & wanted_categories)
+
+            matched = matched[matched.apply(matches_category, axis=1)]
         matched = _filter_export_tokens(matched, "modality", modalities)
+        if data_types and not matched.empty:
+            wanted = {canonical_imaging_token(value).casefold() for value in data_types}
+            media_labels = {
+                "whole_slide_image": "Whole Slide Image",
+                "still_image": "Still Image",
+                "video": "Video",
+                "spectral_or_array": "Spectral/Array Data",
+                "tabular": "Tabular Data",
+            }
+
+            def matches_type(row: pd.Series) -> bool:
+                tokens: set[str] = set()
+                for column in ("data_type", "modality"):
+                    tokens.update(value.casefold() for value in split_tokens(row.get(column)))
+                modality_tokens = {
+                    value.upper() for value in split_tokens(row.get("modality"))
+                }
+                for media in split_tokens(row.get("media_kind")):
+                    label = media_labels.get(media.casefold())
+                    if label:
+                        tokens.add(label.casefold())
+                roles = {value.casefold() for value in split_tokens(row.get("object_role"))}
+                if "SEG" in modality_tokens:
+                    roles.add("segmentation")
+                if modality_tokens & {"ANN", "KO", "PR", "RTSTRUCT", "SR"}:
+                    roles.add("annotation")
+                if "segmentation" in roles:
+                    tokens.add("segmentation")
+                if roles & {"annotation", "annotation_snapshot", "aim_segmentation_annotation"}:
+                    tokens.add("annotation")
+                if roles & {
+                    "segmentation",
+                    "annotation",
+                    "annotation_snapshot",
+                    "aim_segmentation_annotation",
+                }:
+                    tokens.add("annotation/segmentation")
+                return bool(tokens & wanted)
+
+            matched = matched[matched.apply(matches_type, axis=1)]
         return _filter_export_tokens(matched, "body_part_examined", body_parts)
 
     def retain_unrouted(
@@ -2706,13 +2928,26 @@ def collect_filtered_imaging_routes(
         and paths.public_non_dicom_db is not None
         and paths.public_non_dicom_db.exists()
     ):
+        public_participant_source = preferred_object(
+            paths.public_non_dicom_db,
+            "agent_public_non_dicom_asset_participants",
+        )
+        public_participant_columns = set(
+            read_sql(
+                paths.public_non_dicom_db,
+                f"SELECT name FROM pragma_table_info('{public_participant_source}')",
+            ).get("name", pd.Series(dtype=str)).astype(str)
+        )
+        object_role_sql = (
+            "object_role" if "object_role" in public_participant_columns else "'' AS object_role"
+        )
         public_non_dicom = _read_export_rows(
             paths.public_non_dicom_db,
             ("agent_public_non_dicom_asset_participants",),
             (
                 "short_title, TRIM(subject_id) AS subject_id, file_name, package_path, "
                 "asset_id, file_format, media_kind, imaging_domain, modality, "
-                "'' AS body_part_examined"
+                f"{object_role_sql}, '' AS body_part_examined"
             ),
             "short_title",
             short_titles,

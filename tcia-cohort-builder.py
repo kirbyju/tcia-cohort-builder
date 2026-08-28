@@ -301,8 +301,8 @@ def clear_filters() -> None:
     for key in (
         "draft_datasets",
         "draft_access",
-        "draft_imaging",
-        "draft_modalities",
+        "draft_data_categories",
+        "draft_data_types",
         "draft_body_parts",
         "draft_file_formats",
         "draft_pathology_protocols",
@@ -402,8 +402,8 @@ def render_filter_chips(filters: list[tuple[str, object]]) -> None:
 
 def cohort_export_fingerprint(
     patients: pd.DataFrame,
-    imaging_sources: list[str],
-    modalities: list[str],
+    data_categories: list[str],
+    data_types: list[str],
     body_parts: list[str],
 ) -> str:
     digest = hashlib.sha256()
@@ -411,7 +411,7 @@ def cohort_export_fingerprint(
     for value in patient_keys:
         digest.update(value.encode("utf-8"))
         digest.update(b"\0")
-    for group in (imaging_sources, modalities, body_parts):
+    for group in (data_categories, data_types, body_parts):
         digest.update("\x1f".join(sorted(group, key=str.casefold)).encode("utf-8"))
         digest.update(b"\0")
     return digest.hexdigest()
@@ -443,8 +443,8 @@ def render_filtered_cohort_export(
     patients: pd.DataFrame,
     membership_rows: pd.DataFrame,
     selected_datasets: list[str],
-    imaging_sources: list[str],
-    modalities: list[str],
+    data_categories: list[str],
+    data_types: list[str],
     body_parts: list[str],
 ) -> None:
     with st.expander("Download filtered cohort", expanded=False):
@@ -471,8 +471,8 @@ def render_filtered_cohort_export(
             ].drop_duplicates().astype(str).tolist()
         fingerprint = cohort_export_fingerprint(
             patients,
-            imaging_sources,
-            modalities,
+            data_categories,
+            data_types,
             body_parts + selected_datasets + [str(include_related)],
         )
         prepared = st.session_state.get("draft_cohort_export")
@@ -486,9 +486,9 @@ def render_filtered_cohort_export(
             "Prepare all matching patients—not only the visible table rows—as a "
             "patient-level clinical CSV plus route-specific TCIA Data Retriever manifests."
         )
-        if modalities or body_parts:
+        if data_types or body_parts:
             st.caption(
-                "Modality and body-part filters are reapplied to individual imaging "
+                "Data-type and body-part filters are reapplied to individual imaging "
                 "rows, so unrelated series or files from a matching patient are excluded."
             )
         if len(patients) > 20_000:
@@ -507,8 +507,8 @@ def render_filtered_cohort_export(
                     paths,
                     catalog,
                     route_patients,
-                    imaging_sources=imaging_sources,
-                    modalities=modalities,
+                    imaging_sources=data_categories,
+                    data_types=data_types,
                     body_parts=body_parts,
                     direct_collection_titles=direct_collection_titles,
                 )
@@ -1416,7 +1416,7 @@ def main() -> None:
         membership_rows,
         str(dataset_type),
     )
-    f1, f2, f3, f4 = st.columns([1.35, 1, .8, 1])
+    f1, f2, f3 = st.columns([1.5, 1.1, .8])
     search = f1.text_input("Search", placeholder="Dataset or patient ID", key="draft_search").strip()
     datasets = f2.multiselect(
         "Dataset",
@@ -1424,18 +1424,6 @@ def main() -> None:
         key="draft_datasets",
     )
     access = f3.multiselect("Access", option_values(patients, "resolved_access_level"), format_func=access_label, key="draft_access")
-    imaging = f4.multiselect(
-        "Available data",
-        [
-            "Public DICOM",
-            "MHA volumes",
-            "NIfTI files",
-            "Pathology images",
-            "Annotations / segmentations",
-            "Clinical data",
-        ],
-        key="draft_imaging",
-    )
 
     working = scoped_patients.copy()
     if search:
@@ -1457,30 +1445,33 @@ def main() -> None:
         ]
     if access:
         working = working[working["resolved_access_level"].isin(access)]
-    if imaging:
-        source_columns = {
-            "Public DICOM": "has_public_dicom",
-            "MHA volumes": "mha_volumes",
-            "NIfTI files": "has_nifti",
-            "Pathology images": "has_pathdb",
-            "Annotations / segmentations": "has_annotations",
-            "Clinical data": "has_clinical",
-        }
-        mask = pd.Series(False, index=working.index)
-        for source in imaging:
-            mask |= working[source_columns[source]].fillna(False).astype(bool)
-        working = working[mask]
+
+    c1, c2, c3 = st.columns(3)
+    data_categories = c1.multiselect(
+        "Data category",
+        token_options(working, "data_categories"),
+        key="draft_data_categories",
+        help="Broad content category aligned with TCIA WordPress download labels.",
+    )
+    working = apply_token_filter(working, "data_categories", data_categories)
+    data_types = c2.multiselect(
+        "Data type",
+        token_options(working, "data_types"),
+        key="draft_data_types",
+        help="Specific modality or content type, such as CT, MR, Segmentation, or Whole Slide Image.",
+    )
+    working = apply_token_filter(working, "data_types", data_types)
+    file_formats = c3.multiselect(
+        "File format",
+        token_options(working, "file_formats"),
+        key="draft_file_formats",
+        help="Physical encoding such as DICOM, NIfTI, MHA, SVS, CSV, or MPG.",
+    )
+    working = apply_token_filter(working, "file_formats", file_formats)
 
     with st.expander("Advanced clinical and imaging filters", expanded=False):
-        st.markdown("**Imaging**")
-        a1, a2, a3 = st.columns(3)
-        modalities = a1.multiselect(
-            "Modality",
-            token_options(working, "modalities"),
-            key="draft_modalities",
-        )
-        working = apply_token_filter(working, "modalities", modalities)
-        body_parts = a2.multiselect(
+        st.markdown("**Imaging detail**")
+        body_parts = st.multiselect(
             "Body part",
             token_options(working, "body_parts"),
             key="draft_body_parts",
@@ -1491,13 +1482,6 @@ def main() -> None:
             ),
         )
         working = apply_token_filter(working, "body_parts", body_parts)
-        file_formats = a3.multiselect(
-            "File format",
-            token_options(working, "file_formats"),
-            key="draft_file_formats",
-            help="Format reflects participant-linked inventory such as DICOM, NIfTI, SVS, MHA, or NRRD.",
-        )
-        working = apply_token_filter(working, "file_formats", file_formats)
 
         multiple_imaging_dates = st.toggle(
             "Multiple imaging dates",
@@ -1513,7 +1497,7 @@ def main() -> None:
             ]
 
         pathology_values: dict[str, list[str]] = {}
-        if "Pathology images" in imaging:
+        if "Pathology" in data_categories:
             st.markdown("**Pathology**")
             p1, p2 = st.columns(2)
             pathology_filters = [
@@ -1641,8 +1625,8 @@ def main() -> None:
             ("Search", search),
             ("Dataset", datasets),
             ("Access", [access_label(value) for value in access]),
-            ("Imaging", imaging),
-            ("Modality", modalities),
+            ("Data category", data_categories),
+            ("Data type", data_types),
             ("Body part", body_parts),
             ("File format", file_formats),
             (
@@ -1687,8 +1671,8 @@ def main() -> None:
         working,
         visible_memberships,
         datasets,
-        imaging,
-        modalities,
+        data_categories,
+        data_types,
         body_parts,
     )
 
@@ -1702,8 +1686,8 @@ def main() -> None:
                 search.casefold(),
                 tuple(datasets),
                 tuple(access),
-                tuple(imaging),
-                tuple(modalities),
+                tuple(data_categories),
+                tuple(data_types),
                 tuple(body_parts),
                 tuple(file_formats),
                 bool(multiple_imaging_dates),
@@ -1760,8 +1744,8 @@ def main() -> None:
                     "public_dicom_files_outside_idc",
                     "public_non_dicom_files",
                     "controlled_files",
-                    "available_imaging",
-                    "modalities",
+                    "data_categories",
+                    "data_types",
                     "body_parts",
                     "primary_diagnosis",
                     "primary_site",
@@ -1787,8 +1771,8 @@ def main() -> None:
                     ),
                     "subject_id": st.column_config.TextColumn("Patient", pinned=True),
                     "resolved_access_level": st.column_config.TextColumn("Access"),
-                    "available_imaging": st.column_config.TextColumn("Available data", width="large"),
-                    "modalities": st.column_config.TextColumn("Modality"),
+                    "data_categories": st.column_config.TextColumn("Data category", width="medium"),
+                    "data_types": st.column_config.TextColumn("Data type", width="large"),
                     "body_parts": st.column_config.TextColumn("Body part"),
                     "primary_diagnosis": st.column_config.TextColumn("Diagnosis"),
                     "primary_site": st.column_config.TextColumn("Site"),

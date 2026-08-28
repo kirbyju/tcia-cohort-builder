@@ -204,13 +204,28 @@ class V2ArtifactCacheTests(unittest.TestCase):
     def test_unsupported_component_schema_is_not_accepted(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = Path(directory)
-            bundle = stable_bundle(schema_version=7)
+            bundle = stable_bundle(schema_version=8)
             write_install(cache, bundle)
             (cache / "participant_inventory.sqlite").write_bytes(b"database")
 
             self.assertIsNone(installed_component(cache, "participant_inventory"))
             with self.assertRaisesRegex(RuntimeError, "not installed"):
                 require_installed_component(cache, "participant_inventory")
+
+    def test_participant_schema_seven_is_accepted_during_transition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            bundle = stable_bundle(schema_version=7)
+            write_install(cache, bundle)
+            with sqlite3.connect(cache / "participant_inventory.sqlite") as connection:
+                connection.execute("CREATE TABLE example (value TEXT)")
+
+            self.assertEqual(
+                require_installed_component(
+                    cache, "participant_inventory"
+                ).schema_version,
+                7,
+            )
 
 
 if __name__ == "__main__":

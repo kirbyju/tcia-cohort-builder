@@ -373,6 +373,12 @@ class CohortBuilderDataTests(unittest.TestCase):
             self.assertEqual(row["primary_diagnosis"], "Dataset diagnosis")
             self.assertTrue(bool(row["primary_diagnosis_is_inferred"]))
             self.assertTrue(bool(row["has_annotations"]))
+            self.assertEqual(
+                row["data_categories"],
+                "Annotations/Segmentations; Radiology",
+            )
+            self.assertIn("Annotation/Segmentation", row["data_types"])
+            self.assertIn("CT", row["data_types"])
             self.assertIn("MHA", row["file_formats"])
             self.assertEqual(
                 row["identity_resolution_method"],

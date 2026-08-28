@@ -9,11 +9,13 @@ and supporting files, and preparing retrieval manifests.
 - one row per dataset-scoped patient;
 - dataset-scoped Collection and Analysis Result participants kept distinct;
 - basic and advanced cohort filters with a source-aware patient detail panel;
+- separate data-category, data-type, and file-format facets aligned with the
+  TCIA WordPress label hierarchy, with access kept independent;
 - V2 Participant Inventory search and summaries for public DICOM, public
   non-DICOM, controlled-access, and clinical availability;
 - separate IDC series and Aspera-only public DICOM holdings;
 - on-demand IDC, public non-DICOM, controlled-access, and clinical detail;
-- opt-in clinical cohort filters, longitudinal imaging context, and schema-7
+- opt-in clinical cohort filters, longitudinal imaging context, and schema-7/8
   public image metadata;
 - public WordPress Aspera package links shown separately from participant assets
   and TCIA Data Retriever routes;
@@ -65,14 +67,15 @@ python3 scripts/tcia_v2_bundle.py install \
 The app reads the bundle manifest and official install receipt from
 `../tcia-query-skill/cache/tcia-metadata-v2-latest/`. It supports the stable V2
 `full` and `streamlined` contracts (bundle schema 2), Participant Inventory
-schema 6, and Snapshot schema 7. Unsupported or incomplete installations fail
-with an explicit operator error. Downloads, hashing, SQLite integrity checks,
-and atomic replacement remain the responsibility of the official query-skill
-bundle installer. The startup call is cached once per Streamlit server process
-rather than repeated on widget reruns or for each browser session.
+schemas 6 and 7, and Snapshot schema 7. Unsupported or incomplete installations
+fail with an explicit operator error. Downloads, hashing, SQLite integrity
+checks, and atomic replacement remain the responsibility of the official
+query-skill bundle installer. The startup call is cached once per Streamlit
+server process rather than repeated on widget reruns or for each browser
+session.
 
-The consumer requires public non-DICOM schema 7, controlled-access schema 2,
-and clinical schema 17. It does not read preview caches or
+The consumer accepts public non-DICOM schemas 7 and 8, controlled-access schema
+2, and clinical schema 17. It does not read preview caches or
 `tcia-snapshot-latest` compatibility caches during V2 integration.
 
 The compact Participant Inventory reports clinical availability but does not
@@ -83,6 +86,12 @@ imaging detail exposes selected file-grain acquisition and sequence metadata,
 direct viewer/access locations, coverage summaries, and review notes. Verbose
 evidence remains in optional audit companions and is not read by the public
 app.
+
+Participant Inventory schema 7 adds geometry status summaries. IDC DICOM
+statuses come from idc-index's separate volume geometry index; eligible
+non-IDC DICOM and single-file volume assets remain `not_checked` until an
+external batch result is imported. The app does not infer geometric coherence
+from file format or modality.
 
 Set `TCIA_V2_INSTALL_DIR` to share one official bundle installation with the
 MCP and REST services. `TCIA_METADATA_V2_CACHE` is the Streamlit-specific
