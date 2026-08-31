@@ -31,6 +31,19 @@ IDC_COLUMNS = [
     "license_short_name",
     "source_DOI",
 ]
+IDC_GEOMETRY_COLUMNS = [
+    "single_orientation",
+    "orthogonal_orientation",
+    "unique_slice_positions",
+    "consistent_in_plane_row",
+    "consistent_in_plane_col",
+    "consistent_pixel_spacing",
+    "consistent_image_dimensions",
+    "uniform_slice_spacing",
+    "obliquity_degrees",
+    "regularly_spaced_3d_volume",
+]
+IDC_OUTPUT_COLUMNS = IDC_COLUMNS + ["volume_geometry_indexed"] + IDC_GEOMETRY_COLUMNS
 STRING_COLUMNS = [
     column for column in IDC_COLUMNS if column not in {"instanceCount", "series_size_MB"}
 ]
@@ -48,6 +61,24 @@ def refresh_idc_metadata(output_path: Path, batch_size: int = 20) -> None:
     collection_ids = collections["collection_id"].astype(str).tolist()
     if not collection_ids:
         raise RuntimeError("The current IDC index returned no collections.")
+
+    geometry = client.sql_query(
+        "SELECT SeriesInstanceUID, "
+        + ", ".join(IDC_GEOMETRY_COLUMNS)
+        + " FROM volume_geometry_index"
+    )
+    if geometry is None or geometry.empty:
+        raise RuntimeError("The current IDC volume geometry index returned no rows.")
+    if geometry["SeriesInstanceUID"].duplicated().any():
+        raise RuntimeError("The IDC volume geometry index contains duplicate series UIDs.")
+    geometry["SeriesInstanceUID"] = geometry["SeriesInstanceUID"].astype("string")
+    for column in IDC_GEOMETRY_COLUMNS:
+        if column != "obliquity_degrees":
+            geometry[column] = geometry[column].astype("boolean")
+    geometry["obliquity_degrees"] = pd.to_numeric(
+        geometry["obliquity_degrees"], errors="coerce"
+    ).astype("float64")
+    geometry["volume_geometry_indexed"] = True
 
     stats = client.sql_query(
         """
@@ -92,8 +123,22 @@ def refresh_idc_metadata(output_path: Path, batch_size: int = 20) -> None:
             frame["series_size_MB"] = pd.to_numeric(
                 frame["series_size_MB"], errors="coerce"
             ).astype("float64")
+            frame = frame.merge(
+                geometry,
+                on="SeriesInstanceUID",
+                how="left",
+                validate="many_to_one",
+            )
+            frame["volume_geometry_indexed"] = frame[
+                "volume_geometry_indexed"
+            ].astype("boolean").fillna(False)
+            for column in IDC_GEOMETRY_COLUMNS:
+                if column != "obliquity_degrees":
+                    frame[column] = frame[column].astype("boolean")
 
-            table = pa.Table.from_pandas(frame[IDC_COLUMNS], preserve_index=False)
+            table = pa.Table.from_pandas(
+                frame[IDC_OUTPUT_COLUMNS], preserve_index=False
+            )
             if writer is None:
                 writer = pq.ParquetWriter(
                     temporary_path,

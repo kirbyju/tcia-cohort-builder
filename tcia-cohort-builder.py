@@ -15,6 +15,8 @@ import streamlit as st
 
 from cohort_builder_data import (
     DATASET_TYPE_FILTERS,
+    GEOMETRY_FILTER_OPTIONS,
+    add_idc_imaging_facets,
     POLICY_URL,
     DataPaths,
     add_idc_viewer_urls,
@@ -27,6 +29,8 @@ from cohort_builder_data import (
     count_visible_dataset_contexts,
     deduplicate_cart,
     filter_patient_groups_by_dataset_type,
+    filter_patient_groups_by_asset_facets,
+    filter_imaging_rows,
     load_dataset_catalog,
     load_dataset_aspera_packages,
     load_dataset_coverage_states,
@@ -36,6 +40,7 @@ from cohort_builder_data import (
     load_patient_idc_scope,
     load_patient_public_non_dicom,
     load_participant_assets,
+    load_participant_asset_facets,
     load_participant_identity_evidence,
     load_participant_identifiers,
     load_public_non_dicom_image_metadata,
@@ -56,7 +61,7 @@ from v2_artifacts import (
 )
 
 
-PATIENT_INDEX_SCHEMA_VERSION = 13
+PATIENT_INDEX_SCHEMA_VERSION = 14
 APP_DIR = Path(__file__).resolve().parent
 BRAND_SKILL_DIR = Path.home() / ".codex" / "skills" / "tcia-brand-guidelines"
 LOGO_PATH = BRAND_SKILL_DIR / "assets" / "tcia-logo-dark.svg"
@@ -179,6 +184,13 @@ def cached_patient_views(
 @st.cache_data(show_spinner=False)
 def cached_catalog(paths: DataPaths, signatures: tuple) -> pd.DataFrame:
     return load_dataset_catalog(paths.snapshot_db)
+
+
+@st.cache_data(show_spinner=False)
+def cached_participant_asset_facets(
+    paths: DataPaths, signatures: tuple
+) -> pd.DataFrame:
+    return load_participant_asset_facets(paths.participant_db)
 
 
 @st.cache_resource(show_spinner="Preparing clinical and non-DICOM metadata…")
@@ -315,6 +327,8 @@ def clear_filters() -> None:
         st.session_state[key] = []
     st.session_state["draft_age_at_imaging"] = (0, 120)
     st.session_state["draft_multiple_imaging_dates"] = False
+    st.session_state["draft_geometry"] = "Any"
+    st.session_state["draft_imaging_contents"] = "All available imaging"
     st.session_state["draft_include_inferred_clinical"] = True
     st.session_state["draft_conflicts"] = False
     st.session_state["patient_results_page"] = 1
@@ -404,16 +418,22 @@ def cohort_export_fingerprint(
     patients: pd.DataFrame,
     data_categories: list[str],
     data_types: list[str],
+    file_formats: list[str],
     body_parts: list[str],
+    geometry: str,
+    imaging_contents: str,
 ) -> str:
     digest = hashlib.sha256()
     patient_keys = sorted(patients.get("patient_key", pd.Series(dtype=str)).astype(str))
     for value in patient_keys:
         digest.update(value.encode("utf-8"))
         digest.update(b"\0")
-    for group in (data_categories, data_types, body_parts):
+    for group in (data_categories, data_types, file_formats, body_parts):
         digest.update("\x1f".join(sorted(group, key=str.casefold)).encode("utf-8"))
         digest.update(b"\0")
+    digest.update(geometry.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(imaging_contents.encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -445,7 +465,10 @@ def render_filtered_cohort_export(
     selected_datasets: list[str],
     data_categories: list[str],
     data_types: list[str],
+    file_formats: list[str],
     body_parts: list[str],
+    geometry: str,
+    imaging_contents: str,
 ) -> None:
     with st.expander("Download filtered cohort", expanded=False):
         include_related = False
@@ -473,7 +496,10 @@ def render_filtered_cohort_export(
             patients,
             data_categories,
             data_types,
+            file_formats,
             body_parts + selected_datasets + [str(include_related)],
+            geometry,
+            imaging_contents,
         )
         prepared = st.session_state.get("draft_cohort_export")
         stale_export = bool(
@@ -486,10 +512,16 @@ def render_filtered_cohort_export(
             "Prepare all matching patients—not only the visible table rows—as a "
             "patient-level clinical CSV plus route-specific TCIA Data Retriever manifests."
         )
-        if data_types or body_parts:
+        matching_only = imaging_contents == "Only imaging matching filters"
+        if matching_only:
             st.caption(
-                "Data-type and body-part filters are reapplied to individual imaging "
-                "rows, so unrelated series or files from a matching patient are excluded."
+                "The selected imaging filters are reapplied to individual series and "
+                "files. The Imaging & Files preview uses the same facet rules."
+            )
+        else:
+            st.caption(
+                "All participant-linked imaging in the selected dataset scope is included, "
+                "even when a narrower imaging filter qualified the participant."
             )
         if len(patients) > 20_000:
             st.warning(
@@ -507,13 +539,27 @@ def render_filtered_cohort_export(
                     paths,
                     catalog,
                     route_patients,
-                    imaging_sources=data_categories,
-                    data_types=data_types,
-                    body_parts=body_parts,
+                    imaging_sources=data_categories if matching_only else (),
+                    data_types=data_types if matching_only else (),
+                    file_formats=file_formats if matching_only else (),
+                    body_parts=body_parts if matching_only else (),
+                    geometry=geometry if matching_only else "Any",
                     direct_collection_titles=direct_collection_titles,
                 )
                 payload, filename, mime, counts = build_filtered_cohort_download(
-                    patients, routes, unrouted
+                    patients,
+                    routes,
+                    unrouted,
+                    selection={
+                        "selected_datasets": selected_datasets,
+                        "include_related_dataset_contexts": include_related,
+                        "data_categories": data_categories,
+                        "data_types": data_types,
+                        "file_formats": file_formats,
+                        "body_parts": body_parts,
+                        "image_geometry": geometry,
+                        "imaging_contents": imaging_contents,
+                    },
                 )
             prepared = {
                 "fingerprint": fingerprint,
@@ -689,6 +735,12 @@ def render_imaging(
     members: pd.DataFrame,
     *,
     include_all_related: bool = False,
+    data_categories: list[str] | None = None,
+    data_types: list[str] | None = None,
+    file_formats: list[str] | None = None,
+    body_parts: list[str] | None = None,
+    geometry: str = "Any",
+    matching_only: bool = False,
 ) -> None:
     if members.empty:
         st.info("No dataset-scoped imaging context is available for this patient.")
@@ -711,6 +763,21 @@ def render_imaging(
         members,
         include_all_related=include_all_related,
     )
+    dicom = add_idc_imaging_facets(dicom)
+    dicom_total_count = (
+        int(dicom["SeriesInstanceUID"].nunique())
+        if not dicom.empty and "SeriesInstanceUID" in dicom
+        else 0
+    )
+    if matching_only:
+        dicom = filter_imaging_rows(
+            dicom,
+            data_categories=data_categories or (),
+            data_types=data_types or (),
+            file_formats=file_formats or (),
+            body_parts=body_parts or (),
+            geometry=geometry,
+        )
     dicom_count = (
         int(dicom["SeriesInstanceUID"].nunique())
         if not dicom.empty and "SeriesInstanceUID" in dicom
@@ -726,6 +793,12 @@ def render_imaging(
     public_non_dicom_count = scope_count("public_non_dicom_files")
     controlled_count = scope_count("controlled_files")
 
+    if matching_only:
+        st.info(
+            "Showing only imaging that matches the cohort imaging filters. "
+            "The cohort package uses the same facet rules."
+        )
+
     source_tabs = st.tabs(
         [
             f"Public DICOM {dicom_count:,}",
@@ -738,7 +811,7 @@ def render_imaging(
     if source_tabs[0].open:
       with source_tabs[0]:
         st.caption(
-            f"IDC series: {dicom_count:,} · "
+            f"IDC series: {dicom_count:,} shown of {dicom_total_count:,} available · "
             f"Public DICOM files outside IDC: {aspera_dicom_count:,}"
         )
         if dicom.empty:
@@ -758,6 +831,7 @@ def render_imaging(
                     "Modality",
                     "SeriesDescription",
                     "BodyPartExamined",
+                    "geometry_status",
                     "instanceCount",
                     "SeriesInstanceUID",
                     "viewer_url",
@@ -770,9 +844,15 @@ def render_imaging(
                 width="stretch",
                 column_config={
                     "viewer_url": st.column_config.LinkColumn("Viewer", display_text="Open viewer"),
+                    "geometry_status": st.column_config.TextColumn("Image geometry"),
                 },
             )
-            if st.button("Add all public DICOM series", key=f"draft_add_dicom_{patient_key}_{'all' if include_all_related else short_title}"):
+            add_label = (
+                "Add matching public DICOM series"
+                if matching_only
+                else "Add all public DICOM series"
+            )
+            if st.button(add_label, key=f"draft_add_dicom_{patient_key}_{'all' if include_all_related else short_title}"):
                 finish_cart_add(
                     add_cart_items(
                         [
@@ -819,6 +899,15 @@ def render_imaging(
                     if aspera_frames
                     else pd.DataFrame()
                 )
+                if matching_only and not aspera_dicom.empty:
+                    aspera_dicom = filter_imaging_rows(
+                        aspera_dicom,
+                        data_categories=data_categories or (),
+                        data_types=data_types or (),
+                        file_formats=file_formats or (),
+                        body_parts=body_parts or (),
+                        geometry=geometry,
+                    )
                 if not aspera_dicom.empty:
                     columns = [
                         column for column in (
@@ -860,14 +949,25 @@ def render_imaging(
             public_detail = public_detail.drop_duplicates(
                 subset=["dataset_context", "asset_id"], keep="first"
             )
+        public_total_count = len(public_detail)
+        if matching_only and not public_detail.empty:
+            public_detail = filter_imaging_rows(
+                public_detail,
+                data_categories=data_categories or (),
+                data_types=data_types or (),
+                file_formats=file_formats or (),
+                body_parts=body_parts or (),
+                geometry=geometry,
+            )
         if paths.public_non_dicom_db is None or not paths.public_non_dicom_db.exists():
             render_detail_install_notice(
                 "Public non-DICOM file detail is not installed."
             )
         elif public_detail.empty:
             st.info(
-                "No participant-linked public non-DICOM assets were found. This is "
-                "not proof that the dataset has none; review the coverage states below."
+                "No participant-linked public non-DICOM assets match the current imaging "
+                "filters. This is not proof that the dataset has none; review the coverage "
+                "states below."
             )
         else:
             image_metadata = load_public_non_dicom_image_metadata(
@@ -882,6 +982,7 @@ def render_imaging(
                 public_detail,
                 (
                     "dataset_context", "file_name", "asset_name", "file_format", "media_kind", "modality",
+                    "geometry_status", "source_url",
                     "body_part_examined", "study_datetime", "sequence_class",
                     "sequence_tags", "sequences_present", "acquisition_dimensionality",
                     "scanner_site", "manufacturer", "manufacturer_model_name",
@@ -898,8 +999,17 @@ def render_imaging(
                 public_detail[columns],
                 hide_index=True,
                 width="stretch",
+                column_config={
+                    "source_url": st.column_config.LinkColumn(
+                        "Dataset package", display_text="Open package"
+                    ),
+                    "geometry_status": st.column_config.TextColumn(
+                        "Image geometry"
+                    ),
+                },
             )
             st.caption(
+                f"Showing {len(public_detail):,} of {public_total_count:,} logical assets. "
                 "The tab count is the participant-linked represented file count from "
                 "the Participant Inventory. Each row is one logical asset; location "
                 "count shows delivery/viewer copies without multiplying the asset count."
@@ -1015,6 +1125,20 @@ def render_imaging(
             if controlled_frames
             else pd.DataFrame()
         )
+        controlled_total_count = len(controlled)
+        if not controlled.empty:
+            controlled = controlled.copy()
+            controlled["file_format"] = controlled.get("file_type", "")
+            controlled["geometry_status"] = "not_applicable"
+        if matching_only and not controlled.empty:
+            controlled = filter_imaging_rows(
+                controlled,
+                data_categories=data_categories or (),
+                data_types=data_types or (),
+                file_formats=file_formats or (),
+                body_parts=body_parts or (),
+                geometry=geometry,
+            )
         if not paths.controlled_db.exists():
             render_detail_install_notice(
                 "Controlled-access metadata are not installed; controlled payloads remain restricted."
@@ -1029,8 +1153,11 @@ def render_imaging(
                 f'<div class="access-callout"><strong>Controlled metadata only.</strong> Authorization is required before retrieval. Review the <a href="{POLICY_URL}">TCIA policy</a>.</div>',
                 unsafe_allow_html=True,
             )
-            columns = [column for column in ("dataset_context", "route_system", "modality", "study_date", "series_description", "file_name", "drs_uri") if column in controlled]
+            columns = [column for column in ("dataset_context", "route_system", "modality", "file_format", "study_date", "series_description", "file_name", "drs_uri") if column in controlled]
             st.dataframe(controlled[columns], hide_index=True, width="stretch")
+            st.caption(
+                f"Showing {len(controlled):,} of {controlled_total_count:,} controlled metadata rows."
+            )
             routed = controlled[controlled["drs_uri"].fillna("").astype(str).str.strip() != ""]
             if st.button("Add authorized DRS routes", disabled=routed.empty, key=f"draft_add_drs_{patient_key}_{'all' if include_all_related else short_title}"):
                 finish_cart_add(
@@ -1072,6 +1199,13 @@ def render_patient_detail(
     catalog: pd.DataFrame,
     patient: pd.Series,
     members: pd.DataFrame,
+    *,
+    data_categories: list[str],
+    data_types: list[str],
+    file_formats: list[str],
+    body_parts: list[str],
+    geometry: str,
+    imaging_contents: str,
 ) -> None:
     subject_id = str(patient["subject_id"])
     st.markdown("<div class='section-label'>Selected patient</div>", unsafe_allow_html=True)
@@ -1311,6 +1445,12 @@ def render_patient_detail(
             catalog,
             scope_members,
             include_all_related=include_all_related,
+            data_categories=data_categories,
+            data_types=data_types,
+            file_formats=file_formats,
+            body_parts=body_parts,
+            geometry=geometry,
+            matching_only=imaging_contents == "Only imaging matching filters",
         )
 
 
@@ -1384,6 +1524,7 @@ def main() -> None:
     try:
         patients, membership_rows = cached_patient_views(paths, cache_key)
         catalog = cached_catalog(paths, signatures)
+        participant_asset_facets = cached_participant_asset_facets(paths, signatures)
     except Exception as exc:
         st.exception(exc)
         st.stop()
@@ -1446,28 +1587,68 @@ def main() -> None:
     if access:
         working = working[working["resolved_access_level"].isin(access)]
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     data_categories = c1.multiselect(
         "Data category",
         token_options(working, "data_categories"),
         key="draft_data_categories",
         help="Broad content category aligned with TCIA WordPress download labels.",
     )
-    working = apply_token_filter(working, "data_categories", data_categories)
     data_types = c2.multiselect(
         "Data type",
         token_options(working, "data_types"),
         key="draft_data_types",
         help="Specific modality or content type, such as CT, MR, Segmentation, or Whole Slide Image.",
     )
-    working = apply_token_filter(working, "data_types", data_types)
     file_formats = c3.multiselect(
         "File format",
         token_options(working, "file_formats"),
         key="draft_file_formats",
         help="Physical encoding such as DICOM, NIfTI, MHA, SVS, CSV, or MPG.",
     )
-    working = apply_token_filter(working, "file_formats", file_formats)
+    geometry = c4.segmented_control(
+        "Image geometry",
+        GEOMETRY_FILTER_OPTIONS,
+        default="Any",
+        required=True,
+        key="draft_geometry",
+        help=(
+            "Filters individual series and files by assessed grid or volume regularity. "
+            "Any includes unchecked, indeterminate, out-of-scope, and non-volume data. "
+            "Regular includes items that passed an available geometry assessment. "
+            "Irregular includes items with a known failed geometry check. Geometry "
+            "assessment does not establish image quality or clinical usability."
+        ),
+    )
+    facet_memberships = scoped_memberships
+    if datasets:
+        facet_memberships = facet_memberships[
+            facet_memberships["short_title"].isin(datasets)
+        ]
+    working = filter_patient_groups_by_asset_facets(
+        working,
+        facet_memberships,
+        participant_asset_facets,
+        data_categories=data_categories,
+        data_types=data_types,
+        file_formats=file_formats,
+        geometry=str(geometry),
+    )
+
+    imaging_contents = st.segmented_control(
+        "Imaging & download contents",
+        ("All available imaging", "Only imaging matching filters"),
+        default="All available imaging",
+        required=True,
+        key="draft_imaging_contents",
+        help=(
+            "Controls both Imaging & Files results and the cohort package after matching "
+            "participants are found. All available imaging includes every linked imaging "
+            "item in the selected dataset scope. Only imaging matching filters includes "
+            "series and files satisfying the selected imaging filters. Items without an "
+            "individual route remain inventory-only."
+        ),
+    )
 
     with st.expander("Advanced clinical and imaging filters", expanded=False):
         st.markdown("**Imaging detail**")
@@ -1629,6 +1810,13 @@ def main() -> None:
             ("Data type", data_types),
             ("Body part", body_parts),
             ("File format", file_formats),
+            ("Image geometry", "" if geometry == "Any" else geometry),
+            (
+                "Imaging contents",
+                "Matching filters only"
+                if imaging_contents == "Only imaging matching filters"
+                else "",
+            ),
             (
                 "Imaging dates",
                 "Multiple dates" if multiple_imaging_dates else "",
@@ -1673,7 +1861,10 @@ def main() -> None:
         datasets,
         data_categories,
         data_types,
+        file_formats,
         body_parts,
+        str(geometry),
+        str(imaging_contents),
     )
 
     with st.container():
@@ -1690,6 +1881,8 @@ def main() -> None:
                 tuple(data_types),
                 tuple(body_parts),
                 tuple(file_formats),
+                str(geometry),
+                str(imaging_contents),
                 bool(multiple_imaging_dates),
                 tuple(pathology_values.get("pathology_protocols", [])),
                 tuple(pathology_values.get("pathology_magnifications", [])),
@@ -1830,6 +2023,12 @@ def main() -> None:
                 catalog,
                 selected.iloc[0],
                 selected_members,
+                data_categories=data_categories,
+                data_types=data_types,
+                file_formats=file_formats,
+                body_parts=body_parts,
+                geometry=str(geometry),
+                imaging_contents=str(imaging_contents),
             )
 
 

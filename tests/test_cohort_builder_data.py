@@ -10,6 +10,7 @@ from unittest import mock
 
 from cohort_builder_data import (
     DataPaths,
+    add_idc_imaging_facets,
     aggregate_idc,
     build_patient_index,
     build_filtered_cohort_download,
@@ -25,6 +26,8 @@ from cohort_builder_data import (
     enrich_participants_with_clinical_detail,
     exclude_nlst_clinical_only,
     filter_patient_groups_by_dataset_type,
+    filter_patient_groups_by_asset_facets,
+    filter_imaging_rows,
     idc_viewer_url,
     load_clinical_subjects,
     load_idc_series,
@@ -223,15 +226,15 @@ class CohortBuilderDataTests(unittest.TestCase):
                     "CREATE TABLE agent_public_non_dicom_asset_participants ("
                     "short_title TEXT, subject_id TEXT, file_name TEXT, package_path TEXT, "
                     "asset_id TEXT, file_format TEXT, media_kind TEXT, "
-                    "imaging_domain TEXT, modality TEXT)"
+                    "imaging_domain TEXT, modality TEXT, source_url TEXT)"
                 )
                 connection.execute(
                     "INSERT INTO agent_public_non_dicom_asset_participants "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (
                         "Pedi-Cranial-CT-Healthy", "107", "00107_CT.mha",
                         "package/00107_CT.mha", "asset1", "MHA", "image",
-                        "radiology", "CT",
+                        "radiology", "CT", "https://faspex.example/package",
                     ),
                 )
             missing = root / "missing.sqlite"
@@ -254,6 +257,95 @@ class CohortBuilderDataTests(unittest.TestCase):
             self.assertEqual(len(unrouted), 1)
             self.assertEqual(unrouted.iloc[0]["source"], "Public non-DICOM")
             self.assertIn("dataset-level package", unrouted.iloc[0]["reason"])
+            self.assertEqual(
+                unrouted.iloc[0]["package_url"],
+                "https://faspex.example/package",
+            )
+
+    def test_asset_facets_require_same_row_geometry_and_data_type(self):
+        patients = pd.DataFrame(
+            [
+                {"patient_group_key": "G1", "subject_id": "P1"},
+                {"patient_group_key": "G2", "subject_id": "P2"},
+            ]
+        )
+        memberships = pd.DataFrame(
+            [
+                {"participant_key": "K1", "patient_group_key": "G1"},
+                {"participant_key": "K2", "patient_group_key": "G2"},
+            ]
+        )
+        assets = pd.DataFrame(
+            [
+                {
+                    "participant_key": "K1",
+                    "data_type": "SEG",
+                    "file_format": "DICOM",
+                    "geometry_status": "checked_not_regular",
+                },
+                {
+                    "participant_key": "K1",
+                    "data_type": "CT",
+                    "file_format": "DICOM",
+                    "geometry_status": "checked_regular",
+                },
+                {
+                    "participant_key": "K2",
+                    "data_type": "SEG",
+                    "file_format": "DICOM",
+                    "geometry_status": "checked_regular",
+                },
+            ]
+        )
+
+        matched = filter_patient_groups_by_asset_facets(
+            patients,
+            memberships,
+            assets,
+            data_types=["SEG"],
+            file_formats=["DICOM"],
+            geometry="Regular",
+        )
+
+        self.assertEqual(matched["patient_group_key"].tolist(), ["G2"])
+
+    def test_idc_geometry_status_filters_series_rows(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "SeriesInstanceUID": "regular",
+                    "Modality": "CT",
+                    "volume_geometry_indexed": True,
+                    "regularly_spaced_3d_volume": True,
+                },
+                {
+                    "SeriesInstanceUID": "irregular",
+                    "Modality": "CT",
+                    "volume_geometry_indexed": True,
+                    "regularly_spaced_3d_volume": False,
+                },
+                {
+                    "SeriesInstanceUID": "outside",
+                    "Modality": "SEG",
+                    "volume_geometry_indexed": False,
+                    "regularly_spaced_3d_volume": pd.NA,
+                },
+            ]
+        )
+        enriched = add_idc_imaging_facets(frame)
+
+        self.assertEqual(
+            filter_imaging_rows(enriched, geometry="Regular")[
+                "SeriesInstanceUID"
+            ].tolist(),
+            ["regular"],
+        )
+        self.assertEqual(
+            filter_imaging_rows(enriched, geometry="Irregular")[
+                "SeriesInstanceUID"
+            ].tolist(),
+            ["irregular"],
+        )
 
     def test_participant_availability_distinguishes_unlinked_from_absent(self):
         rows = participant_availability_rows(
@@ -1357,13 +1449,20 @@ class CohortBuilderDataTests(unittest.TestCase):
                     "short_title": "TEST",
                     "subject_id": "P2",
                     "item": "scan.nii.gz",
+                    "package_url": "https://faspex.example/package",
                     "reason": "No supported route.",
                 }
             ]
         )
 
         payload, filename, mime, counts = build_filtered_cohort_download(
-            patients, routes, unrouted
+            patients,
+            routes,
+            unrouted,
+            selection={
+                "image_geometry": "Regular",
+                "imaging_contents": "Only imaging matching filters",
+            },
         )
 
         self.assertEqual(filename, "tcia_filtered_cohort_export.zip")
@@ -1381,6 +1480,7 @@ class CohortBuilderDataTests(unittest.TestCase):
                     "tcia_dicom_series.csv",
                     "tcia_pathdb_files.csv",
                     "tcia_unrouted_imaging_inventory.csv",
+                    "cohort_selection.json",
                 },
             )
             patients_csv = archive.read("tcia_filtered_patients.csv").decode("utf-8")
@@ -1391,6 +1491,13 @@ class CohortBuilderDataTests(unittest.TestCase):
                 dicom_csv.splitlines(),
                 ["SeriesInstanceUID", "1.2.3", "1.2.4"],
             )
+            inventory_csv = archive.read(
+                "tcia_unrouted_imaging_inventory.csv"
+            ).decode("utf-8")
+            self.assertIn("package_url", inventory_csv.splitlines()[0])
+            self.assertIn("https://faspex.example/package", inventory_csv)
+            selection = json.loads(archive.read("cohort_selection.json"))
+            self.assertEqual(selection["image_geometry"], "Regular")
 
 
 if __name__ == "__main__":

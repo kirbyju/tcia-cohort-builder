@@ -93,6 +93,14 @@ non-IDC DICOM and single-file volume assets remain `not_checked` until an
 external batch result is imported. The app does not infer geometric coherence
 from file format or modality.
 
+Data category, data type, file format, and image geometry qualify participants
+through same-asset facet matching. The `Imaging & download contents` control
+then chooses whether Imaging & Files and cohort manifests contain all linked
+imaging for those participants or only series/files matching the imaging
+facets. Dataset-package-only rows remain in the unrouted inventory and include
+the published package URL; they are not represented as individually routable
+TCIA Data Retriever files.
+
 Set `TCIA_V2_INSTALL_DIR` to share one official bundle installation with the
 MCP and REST services. `TCIA_METADATA_V2_CACHE` is the Streamlit-specific
 override when it needs a different installation. Set `TCIA_QUERY_SKILL_ROOT`
@@ -103,8 +111,10 @@ when the query-skill checkout is not adjacent to this repository. Set
 ## Data refresh
 
 `idc_metadata.parquet` is retained in this repository for public DICOM
-drill-down, viewer routing, and manifest export. It is not used to build the
-participant search index. Refresh it with:
+drill-down, viewer routing, geometry filtering, and manifest export. The
+refresh joins IDC's `volume_geometry_index` to the series index by
+`SeriesInstanceUID`. It does not replace Participant Inventory as the identity
+or participant-search authority. Refresh it with:
 
 ```bash
 python fetch_data.py

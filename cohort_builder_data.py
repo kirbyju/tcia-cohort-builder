@@ -22,12 +22,19 @@ from typing import Iterable, Mapping, Sequence
 from urllib.parse import parse_qs, quote, urlparse
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 
 LOGGER = logging.getLogger(__name__)
 POLICY_URL = "https://www.cancerimagingarchive.net/nih-controlled-data-access-policy/"
 OPEN_ACCESS_LEVELS = {"open", "open_noncommercial"}
 DATASET_TYPE_FILTERS = ("All", "Collection", "Analysis Result")
+GEOMETRY_FILTER_OPTIONS = ("Any", "Regular", "Irregular")
+REGULAR_GEOMETRY_STATUSES = {"checked_regular", "checked_grid_geometry"}
+IRREGULAR_GEOMETRY_STATUSES = {
+    "checked_not_regular",
+    "checked_invalid_geometry",
+}
 CLINICAL_CATEGORICAL_COLUMNS = (
     "sex_at_birth",
     "race",
@@ -429,6 +436,182 @@ def participant_data_types(row: Mapping[str, object]) -> str:
     return join_tokens(values)
 
 
+def imaging_row_categories(row: Mapping[str, object]) -> set[str]:
+    """Return user-facing category labels for one series/file-grain row."""
+    categories = {
+        value.casefold() for value in split_tokens(row.get("data_category"))
+    }
+    domains = {value.casefold() for value in split_tokens(row.get("imaging_domain"))}
+    domains.update(
+        value.casefold() for value in split_tokens(row.get("data_domain"))
+    )
+    modalities = {value.upper() for value in split_tokens(row.get("modality"))}
+    roles = {value.casefold() for value in split_tokens(row.get("object_role"))}
+    media = {value.casefold() for value in split_tokens(row.get("media_kind"))}
+    annotation_modalities = {"ANN", "KO", "PR", "RTSTRUCT", "SEG", "SR"}
+    if "radiology" in domains or modalities - {"SM"}:
+        categories.add("radiology")
+    if "pathology" in domains or "SM" in modalities:
+        categories.add("pathology")
+    if (
+        "imaging_annotation" in domains
+        or modalities & annotation_modalities
+        or roles
+        & {
+            "annotation",
+            "annotation_snapshot",
+            "aim_segmentation_annotation",
+            "segmentation",
+        }
+    ):
+        categories.add("annotations/segmentations")
+    if domains & {"endoscopy", "other_imaging"} or "video" in media:
+        categories.add("other imaging")
+    if "clinical" in domains:
+        categories.add("clinical data")
+    return categories
+
+
+def imaging_row_data_types(row: Mapping[str, object]) -> set[str]:
+    """Return user-facing data-type labels for one series/file-grain row."""
+    tokens = {
+        canonical_imaging_token(value).casefold()
+        for column in ("data_type", "modality")
+        for value in split_tokens(row.get(column))
+    }
+    modality_tokens = {value.upper() for value in split_tokens(row.get("modality"))}
+    media_labels = {
+        "whole_slide_image": "Whole Slide Image",
+        "still_image": "Still Image",
+        "video": "Video",
+        "spectral_or_array": "Spectral/Array Data",
+        "tabular": "Tabular Data",
+    }
+    for media in split_tokens(row.get("media_kind")):
+        label = media_labels.get(media.casefold())
+        if label:
+            tokens.add(label.casefold())
+    roles = {value.casefold() for value in split_tokens(row.get("object_role"))}
+    if "SEG" in modality_tokens:
+        roles.add("segmentation")
+    if modality_tokens & {"ANN", "KO", "PR", "RTSTRUCT", "SR"}:
+        roles.add("annotation")
+    if "segmentation" in roles:
+        tokens.add("segmentation")
+    if roles & {"annotation", "annotation_snapshot", "aim_segmentation_annotation"}:
+        tokens.add("annotation")
+    if roles & {
+        "segmentation",
+        "annotation",
+        "annotation_snapshot",
+        "aim_segmentation_annotation",
+    }:
+        tokens.add("annotation/segmentation")
+    return tokens
+
+
+def geometry_matches(row: Mapping[str, object], selected: str) -> bool:
+    """Match one row against the normalized three-state geometry filter."""
+    if selected == "Any":
+        return True
+    if selected not in GEOMETRY_FILTER_OPTIONS:
+        raise ValueError(f"Unsupported geometry filter: {selected}")
+    statuses = {
+        value.casefold() for value in split_tokens(row.get("geometry_status"))
+    }
+    statuses.update(
+        value.casefold() for value in split_tokens(row.get("geometry_statuses"))
+    )
+    regular_count = pd.to_numeric(
+        pd.Series([row.get("geometry_regular_count")]), errors="coerce"
+    ).fillna(0).iloc[0]
+    irregular_count = pd.to_numeric(
+        pd.Series([row.get("geometry_not_regular_count")]), errors="coerce"
+    ).fillna(0).iloc[0]
+    if selected == "Regular":
+        return bool(statuses & REGULAR_GEOMETRY_STATUSES) or regular_count > 0
+    return bool(statuses & IRREGULAR_GEOMETRY_STATUSES) or irregular_count > 0
+
+
+def add_idc_imaging_facets(frame: pd.DataFrame) -> pd.DataFrame:
+    """Add normalized file/category/type and geometry fields to IDC series rows."""
+    if frame.empty:
+        return frame.copy()
+    result = frame.copy()
+    if "modality" not in result and "Modality" in result:
+        result["modality"] = result["Modality"]
+    if "body_part_examined" not in result and "BodyPartExamined" in result:
+        result["body_part_examined"] = result["BodyPartExamined"]
+    result["file_format"] = "DICOM"
+    result["imaging_domain"] = "radiology"
+    result["media_kind"] = "image_series"
+    result["object_role"] = result.get("object_role", "")
+    indexed = result.get(
+        "volume_geometry_indexed", pd.Series(False, index=result.index)
+    ).astype("boolean").fillna(False)
+    regular = result.get(
+        "regularly_spaced_3d_volume", pd.Series(pd.NA, index=result.index)
+    ).astype("boolean")
+    result["geometry_status"] = "not_in_geometry_index_scope"
+    result.loc[indexed & regular.isna(), "geometry_status"] = "checked_indeterminate"
+    result.loc[indexed & regular.fillna(False), "geometry_status"] = "checked_regular"
+    result.loc[indexed & ~regular.fillna(True), "geometry_status"] = "checked_not_regular"
+    result["geometry_regular_count"] = result["geometry_status"].eq(
+        "checked_regular"
+    ).astype(int)
+    result["geometry_not_regular_count"] = result["geometry_status"].eq(
+        "checked_not_regular"
+    ).astype(int)
+    result["data_category"] = result.apply(
+        lambda row: join_tokens(imaging_row_categories(row)), axis=1
+    )
+    result["data_type"] = result.apply(
+        lambda row: join_tokens(imaging_row_data_types(row)), axis=1
+    )
+    return result
+
+
+def filter_imaging_rows(
+    frame: pd.DataFrame,
+    *,
+    data_categories: Sequence[str] = (),
+    data_types: Sequence[str] = (),
+    file_formats: Sequence[str] = (),
+    modalities: Sequence[str] = (),
+    body_parts: Sequence[str] = (),
+    geometry: str = "Any",
+) -> pd.DataFrame:
+    """Apply OR-within/AND-across facets to individual imaging rows."""
+    if frame.empty:
+        return frame.copy()
+    result = frame.copy()
+    wanted_categories = {str(value).casefold() for value in data_categories}
+    if wanted_categories:
+        result = result[
+            result.apply(
+                lambda row: bool(imaging_row_categories(row) & wanted_categories),
+                axis=1,
+            )
+        ]
+    wanted_types = {
+        canonical_imaging_token(value).casefold() for value in data_types
+    }
+    if wanted_types and not result.empty:
+        result = result[
+            result.apply(
+                lambda row: bool(imaging_row_data_types(row) & wanted_types), axis=1
+            )
+        ]
+    result = _filter_export_tokens(result, "file_format", file_formats)
+    result = _filter_export_tokens(result, "modality", modalities)
+    result = _filter_export_tokens(result, "body_part_examined", body_parts)
+    if geometry != "Any" and not result.empty:
+        result = result[
+            result.apply(lambda row: geometry_matches(row, geometry), axis=1)
+        ]
+    return result.copy()
+
+
 def join_token_json(values: Iterable[object]) -> str:
     """Return a JSON token list without losing commas inside source values."""
     tokens: set[str] = set()
@@ -704,7 +887,19 @@ def load_idc_series(
 ) -> pd.DataFrame:
     if not parquet_path.exists():
         return pd.DataFrame()
-    frame = pd.read_parquet(parquet_path, columns=columns, filters=filters)
+    read_columns = list(columns) if columns else None
+    missing_columns: list[str] = []
+    if read_columns:
+        available_columns = set(pq.read_schema(parquet_path).names)
+        missing_columns = [
+            column for column in read_columns if column not in available_columns
+        ]
+        read_columns = [
+            column for column in read_columns if column in available_columns
+        ]
+    frame = pd.read_parquet(parquet_path, columns=read_columns, filters=filters)
+    for column in missing_columns:
+        frame[column] = pd.NA
     if frame.empty:
         return frame
     key_map = dataset_key_map(catalog) if catalog is not None else {}
@@ -1012,6 +1207,75 @@ def load_participant_assets(
         query += " WHERE participant_key = ?"
         params.append(participant_key)
     return read_sql(path, query, params)
+
+
+def load_participant_asset_facets(path: Path | None) -> pd.DataFrame:
+    """Load the narrow asset-grain surface used by cohort facet filtering."""
+    if path is None or preferred_object(path, "agent_participant_assets") is None:
+        return pd.DataFrame()
+    available = set(
+        read_sql(
+            path,
+            "SELECT name FROM pragma_table_info('agent_participant_assets')",
+        ).get("name", pd.Series(dtype=str)).astype(str)
+    )
+    wanted = (
+        "participant_key",
+        "data_category",
+        "data_type",
+        "data_domain",
+        "media_kind",
+        "modality",
+        "file_format",
+        "object_role",
+        "geometry_status",
+        "geometry_regular_count",
+        "geometry_not_regular_count",
+    )
+    select = [column for column in wanted if column in available]
+    if "participant_key" not in select:
+        return pd.DataFrame()
+    return read_sql(path, f"SELECT {', '.join(select)} FROM agent_participant_assets")
+
+
+def filter_patient_groups_by_asset_facets(
+    patients: pd.DataFrame,
+    memberships: pd.DataFrame,
+    assets: pd.DataFrame,
+    *,
+    data_categories: Sequence[str] = (),
+    data_types: Sequence[str] = (),
+    file_formats: Sequence[str] = (),
+    geometry: str = "Any",
+) -> pd.DataFrame:
+    """Keep patient groups with at least one same-row asset facet match."""
+    if patients.empty or not any(
+        (data_categories, data_types, file_formats, geometry != "Any")
+    ):
+        return patients.copy()
+    if assets.empty or memberships.empty:
+        return patients.iloc[0:0].copy()
+    visible_groups = set(patients["patient_group_key"].astype(str))
+    scoped_memberships = memberships[
+        memberships["patient_group_key"].astype(str).isin(visible_groups)
+    ][["participant_key", "patient_group_key"]].drop_duplicates()
+    scoped_assets = assets.merge(
+        scoped_memberships,
+        on="participant_key",
+        how="inner",
+        validate="many_to_one",
+    )
+    matched = filter_imaging_rows(
+        scoped_assets,
+        data_categories=data_categories,
+        data_types=data_types,
+        file_formats=file_formats,
+        geometry=geometry,
+    )
+    matched_groups = set(matched["patient_group_key"].astype(str))
+    return patients[
+        patients["patient_group_key"].astype(str).isin(matched_groups)
+    ].copy()
 
 
 def load_participant_identifiers(path: Path | None, participant_key: str) -> pd.DataFrame:
@@ -2330,12 +2594,41 @@ def load_patient_public_non_dicom(
         if include_dicom
         else "instr(upper(COALESCE(a.file_format, '')), 'DICOM') = 0"
     )
+    asset_columns = set(
+        read_sql(
+            path,
+            "SELECT name FROM pragma_table_info('public_non_dicom_assets')",
+        ).get("name", pd.Series(dtype=str)).astype(str)
+    )
+    geometry_status_sql = (
+        "a.geometry_status" if "geometry_status" in asset_columns else "''"
+    )
+    has_geometry_assessments = (
+        "public_non_dicom_geometry_assessments" in sqlite_objects(path)
+    )
+    regular_count_sql = (
+        "(SELECT COUNT(*) FROM public_non_dicom_geometry_assessments g "
+        "WHERE g.asset_id = a.asset_id "
+        "AND g.geometry_status = 'checked_grid_geometry')"
+        if has_geometry_assessments
+        else "0"
+    )
+    irregular_count_sql = (
+        "(SELECT COUNT(*) FROM public_non_dicom_geometry_assessments g "
+        "WHERE g.asset_id = a.asset_id "
+        "AND g.geometry_status = 'checked_invalid_geometry')"
+        if has_geometry_assessments
+        else "0"
+    )
     return read_sql(
         path,
         f"""
         SELECT a.asset_id, a.dataset_type, a.short_title, a.asset_name,
                a.file_name, a.package_path, a.file_format, a.media_kind,
                a.imaging_domain, a.modality, a.object_role,
+               {geometry_status_sql} AS geometry_status,
+               {regular_count_sql} AS geometry_regular_count,
+               {irregular_count_sql} AS geometry_not_regular_count,
                a.represented_file_count, a.size_bytes,
                a.participant_link_status, a.representation_provenance_class,
                a.source_system, a.source_url, a.quality_flag_json,
@@ -2677,6 +2970,96 @@ def _read_export_rows(
     )
 
 
+def _read_public_participant_export_rows(
+    path: Path, short_titles: Sequence[str]
+) -> pd.DataFrame:
+    """Read public package assets with geometry and their published package URL."""
+    objects = sqlite_objects(path)
+    if not short_titles or "agent_public_non_dicom_asset_participants" not in objects:
+        return pd.DataFrame()
+    placeholders = ",".join("?" for _ in short_titles)
+    if "public_non_dicom_assets" in objects:
+        asset_columns = set(
+            read_sql(
+                path,
+                "SELECT name FROM pragma_table_info('public_non_dicom_assets')",
+            ).get("name", pd.Series(dtype=str)).astype(str)
+        )
+
+        def asset_expr(column: str, fallback: str = "''") -> str:
+            return f"a.{column}" if column in asset_columns else fallback
+
+        geometry_count_columns = (
+            "public_non_dicom_geometry_assessments" in objects
+        )
+        regular_count = (
+            "(SELECT COUNT(*) FROM public_non_dicom_geometry_assessments g "
+            "WHERE g.asset_id=a.asset_id "
+            "AND g.geometry_status='checked_grid_geometry')"
+            if geometry_count_columns
+            else "0"
+        )
+        irregular_count = (
+            "(SELECT COUNT(*) FROM public_non_dicom_geometry_assessments g "
+            "WHERE g.asset_id=a.asset_id "
+            "AND g.geometry_status='checked_invalid_geometry')"
+            if geometry_count_columns
+            else "0"
+        )
+        return read_sql(
+            path,
+            f"""
+            SELECT ap.short_title, TRIM(ap.subject_id) AS subject_id,
+                   {asset_expr('file_name')} AS file_name,
+                   {asset_expr('package_path')} AS package_path,
+                   ap.asset_id,
+                   {asset_expr('file_format')} AS file_format,
+                   {asset_expr('media_kind')} AS media_kind,
+                   {asset_expr('imaging_domain')} AS imaging_domain,
+                   {asset_expr('modality')} AS modality,
+                   {asset_expr('object_role')} AS object_role,
+                   {asset_expr('geometry_status')} AS geometry_status,
+                   {regular_count} AS geometry_regular_count,
+                   {irregular_count} AS geometry_not_regular_count,
+                   {asset_expr('source_url')} AS package_url,
+                   '' AS body_part_examined
+            FROM agent_public_non_dicom_asset_participants ap
+            JOIN public_non_dicom_assets a USING(asset_id)
+            WHERE ap.short_title IN ({placeholders})
+            """,
+            tuple(short_titles),
+        )
+    view_columns = set(
+        read_sql(
+            path,
+            "SELECT name FROM pragma_table_info('agent_public_non_dicom_asset_participants')",
+        ).get("name", pd.Series(dtype=str)).astype(str)
+    )
+
+    def view_expr(column: str, fallback: str = "''") -> str:
+        return column if column in view_columns else fallback
+
+    return _read_export_rows(
+        path,
+        ("agent_public_non_dicom_asset_participants",),
+        (
+            "short_title, TRIM(subject_id) AS subject_id, "
+            f"{view_expr('file_name')} AS file_name, "
+            f"{view_expr('package_path')} AS package_path, asset_id, "
+            f"{view_expr('file_format')} AS file_format, "
+            f"{view_expr('media_kind')} AS media_kind, "
+            f"{view_expr('imaging_domain')} AS imaging_domain, "
+            f"{view_expr('modality')} AS modality, "
+            f"{view_expr('object_role')} AS object_role, "
+            f"{view_expr('geometry_status')} AS geometry_status, "
+            "0 AS geometry_regular_count, 0 AS geometry_not_regular_count, "
+            f"{view_expr('source_url')} AS package_url, '' AS body_part_examined"
+        ),
+        "short_title",
+        short_titles,
+    )
+
+
 def collect_filtered_imaging_routes(
     paths: DataPaths,
     catalog: pd.DataFrame,
@@ -2685,7 +3068,9 @@ def collect_filtered_imaging_routes(
     imaging_sources: Sequence[str] = (),
     modalities: Sequence[str] = (),
     data_types: Sequence[str] = (),
+    file_formats: Sequence[str] = (),
     body_parts: Sequence[str] = (),
+    geometry: str = "Any",
     direct_collection_titles: Sequence[str] = (),
 ) -> tuple[dict[str, list[str]], pd.DataFrame]:
     """Collect route values and auditable unrouted rows for a filtered cohort."""
@@ -2701,11 +3086,26 @@ def collect_filtered_imaging_routes(
         "NIfTI files": ("Public non-DICOM",),
         "Pathology images": ("Public non-DICOM",),
         "Controlled access": ("Controlled-access file metadata",),
-        "Radiology": ("IDC DICOM", "Public non-DICOM"),
-        "Pathology": ("IDC DICOM", "Public non-DICOM"),
-        "Annotations/Segmentations": ("IDC DICOM", "Public non-DICOM"),
-        "Other Imaging": ("Public non-DICOM",),
-        "Clinical Data": (),
+        "Radiology": (
+            "IDC DICOM",
+            "Public non-DICOM",
+            "Controlled-access file metadata",
+        ),
+        "Pathology": (
+            "IDC DICOM",
+            "Public non-DICOM",
+            "Controlled-access file metadata",
+        ),
+        "Annotations/Segmentations": (
+            "IDC DICOM",
+            "Public non-DICOM",
+            "Controlled-access file metadata",
+        ),
+        "Other Imaging": (
+            "Public non-DICOM",
+            "Controlled-access file metadata",
+        ),
+        "Clinical Data": ("Controlled-access file metadata",),
     }
     if imaging_sources:
         requested = {
@@ -2720,101 +3120,30 @@ def collect_filtered_imaging_routes(
             "Controlled-access file metadata",
         }
     short_titles = sorted(set(patients["short_title"].dropna().astype(str)))
+    category_labels = {
+        "radiology",
+        "pathology",
+        "annotations/segmentations",
+        "clinical data",
+        "other imaging",
+    }
+    selected_categories = tuple(
+        value
+        for value in imaging_sources
+        if str(value).casefold() in category_labels
+    )
 
     def filter_rows(frame: pd.DataFrame) -> pd.DataFrame:
         matched = _match_export_rows_to_patients(frame, patients)
-        category_labels = {
-            "radiology",
-            "pathology",
-            "annotations/segmentations",
-            "clinical data",
-            "other imaging",
-        }
-        wanted_categories = {
-            str(value).casefold()
-            for value in imaging_sources
-            if str(value).casefold() in category_labels
-        }
-        if wanted_categories and not matched.empty:
-            annotation_modalities = {"ANN", "KO", "PR", "RTSTRUCT", "SEG", "SR"}
-
-            def matches_category(row: pd.Series) -> bool:
-                domains = {
-                    value.casefold()
-                    for value in split_tokens(row.get("imaging_domain"))
-                }
-                modalities_in_row = {
-                    value.upper() for value in split_tokens(row.get("modality"))
-                }
-                roles = {
-                    value.casefold() for value in split_tokens(row.get("object_role"))
-                }
-                media = {
-                    value.casefold() for value in split_tokens(row.get("media_kind"))
-                }
-                categories: set[str] = set()
-                if domains & {"radiology"} or modalities_in_row - {"SM"}:
-                    categories.add("radiology")
-                if "pathology" in domains or "SM" in modalities_in_row:
-                    categories.add("pathology")
-                if (
-                    "imaging_annotation" in domains
-                    or modalities_in_row & annotation_modalities
-                    or roles & {
-                        "annotation",
-                        "annotation_snapshot",
-                        "aim_segmentation_annotation",
-                        "segmentation",
-                    }
-                ):
-                    categories.add("annotations/segmentations")
-                if domains & {"endoscopy", "other_imaging"} or "video" in media:
-                    categories.add("other imaging")
-                return bool(categories & wanted_categories)
-
-            matched = matched[matched.apply(matches_category, axis=1)]
-        matched = _filter_export_tokens(matched, "modality", modalities)
-        if data_types and not matched.empty:
-            wanted = {canonical_imaging_token(value).casefold() for value in data_types}
-            media_labels = {
-                "whole_slide_image": "Whole Slide Image",
-                "still_image": "Still Image",
-                "video": "Video",
-                "spectral_or_array": "Spectral/Array Data",
-                "tabular": "Tabular Data",
-            }
-
-            def matches_type(row: pd.Series) -> bool:
-                tokens: set[str] = set()
-                for column in ("data_type", "modality"):
-                    tokens.update(value.casefold() for value in split_tokens(row.get(column)))
-                modality_tokens = {
-                    value.upper() for value in split_tokens(row.get("modality"))
-                }
-                for media in split_tokens(row.get("media_kind")):
-                    label = media_labels.get(media.casefold())
-                    if label:
-                        tokens.add(label.casefold())
-                roles = {value.casefold() for value in split_tokens(row.get("object_role"))}
-                if "SEG" in modality_tokens:
-                    roles.add("segmentation")
-                if modality_tokens & {"ANN", "KO", "PR", "RTSTRUCT", "SR"}:
-                    roles.add("annotation")
-                if "segmentation" in roles:
-                    tokens.add("segmentation")
-                if roles & {"annotation", "annotation_snapshot", "aim_segmentation_annotation"}:
-                    tokens.add("annotation")
-                if roles & {
-                    "segmentation",
-                    "annotation",
-                    "annotation_snapshot",
-                    "aim_segmentation_annotation",
-                }:
-                    tokens.add("annotation/segmentation")
-                return bool(tokens & wanted)
-
-            matched = matched[matched.apply(matches_type, axis=1)]
-        return _filter_export_tokens(matched, "body_part_examined", body_parts)
+        return filter_imaging_rows(
+            matched,
+            data_categories=selected_categories,
+            data_types=data_types,
+            file_formats=file_formats,
+            modalities=modalities,
+            body_parts=body_parts,
+            geometry=geometry,
+        )
 
     def retain_unrouted(
         frame: pd.DataFrame, source: str, label_column: str, reason: str
@@ -2828,7 +3157,10 @@ def collect_filtered_imaging_routes(
                 "subject_id": frame["subject_id"],
                 "modality": frame.get("modality", ""),
                 "body_part_examined": frame.get("body_part_examined", ""),
+                "file_format": frame.get("file_format", ""),
+                "geometry_status": frame.get("geometry_status", ""),
                 "item": frame.get(label_column, ""),
+                "package_url": frame.get("package_url", ""),
                 "reason": reason,
             }
         )
@@ -2873,6 +3205,8 @@ def collect_filtered_imaging_routes(
                 "SeriesInstanceUID",
                 "Modality",
                 "BodyPartExamined",
+                "volume_geometry_indexed",
+                "regularly_spaced_3d_volume",
             ],
             filters=parquet_filters or None,
         ).rename(
@@ -2887,7 +3221,7 @@ def collect_filtered_imaging_routes(
                 & (derived_ids != "")
             )
             dicom = dicom[~derived_collection_rows].copy()
-        dicom = filter_rows(dicom)
+        dicom = filter_rows(add_idc_imaging_facets(dicom))
         routed = dicom["SeriesInstanceUID"].fillna("").astype(str).str.strip() != ""
         routes["SeriesInstanceUID"] = (
             dicom.loc[routed, "SeriesInstanceUID"].astype(str).tolist()
@@ -2900,6 +3234,20 @@ def collect_filtered_imaging_routes(
         )
 
     if "Controlled-access file metadata" in requested:
+        controlled_source = preferred_object(
+            paths.controlled_db, "agent_controlled_files", "controlled_files"
+        )
+        controlled_columns = set(
+            read_sql(
+                paths.controlled_db,
+                f"SELECT name FROM pragma_table_info('{controlled_source}')",
+            ).get("name", pd.Series(dtype=str)).astype(str)
+        )
+        controlled_format_sql = (
+            "file_type AS file_format"
+            if "file_type" in controlled_columns
+            else "'' AS file_format"
+        )
         controlled = _read_export_rows(
             paths.controlled_db,
             ("agent_controlled_files", "controlled_files"),
@@ -2907,7 +3255,8 @@ def collect_filtered_imaging_routes(
                 "short_title, COALESCE(NULLIF(TRIM(patient_id), ''), "
                 "NULLIF(TRIM(participant_id), '')) AS subject_id, file_name, "
                 "drs_uri, COALESCE(NULLIF(modality, ''), image_modality) AS modality, "
-                "body_part_examined"
+                f"body_part_examined, {controlled_format_sql}, '' AS geometry_status, "
+                "'' AS package_url"
             ),
             "short_title",
             short_titles,
@@ -2928,29 +3277,8 @@ def collect_filtered_imaging_routes(
         and paths.public_non_dicom_db is not None
         and paths.public_non_dicom_db.exists()
     ):
-        public_participant_source = preferred_object(
-            paths.public_non_dicom_db,
-            "agent_public_non_dicom_asset_participants",
-        )
-        public_participant_columns = set(
-            read_sql(
-                paths.public_non_dicom_db,
-                f"SELECT name FROM pragma_table_info('{public_participant_source}')",
-            ).get("name", pd.Series(dtype=str)).astype(str)
-        )
-        object_role_sql = (
-            "object_role" if "object_role" in public_participant_columns else "'' AS object_role"
-        )
-        public_non_dicom = _read_export_rows(
-            paths.public_non_dicom_db,
-            ("agent_public_non_dicom_asset_participants",),
-            (
-                "short_title, TRIM(subject_id) AS subject_id, file_name, package_path, "
-                "asset_id, file_format, media_kind, imaging_domain, modality, "
-                f"{object_role_sql}, '' AS body_part_examined"
-            ),
-            "short_title",
-            short_titles,
+        public_non_dicom = _read_public_participant_export_rows(
+            paths.public_non_dicom_db, short_titles
         )
         public_non_dicom = filter_rows(public_non_dicom)
         public_non_dicom = public_non_dicom[
@@ -3008,15 +3336,8 @@ def collect_filtered_imaging_routes(
         and paths.public_non_dicom_db is not None
         and paths.public_non_dicom_db.exists()
     ):
-        packaged_dicom = _read_export_rows(
-            paths.public_non_dicom_db,
-            ("agent_public_non_dicom_asset_participants",),
-            (
-                "short_title, TRIM(subject_id) AS subject_id, file_name, package_path, "
-                "file_format, modality, '' AS body_part_examined"
-            ),
-            "short_title",
-            short_titles,
+        packaged_dicom = _read_public_participant_export_rows(
+            paths.public_non_dicom_db, short_titles
         )
         packaged_dicom = packaged_dicom[
             packaged_dicom["file_format"]
@@ -3050,6 +3371,7 @@ def build_filtered_cohort_download(
     patients: pd.DataFrame,
     routes: Mapping[str, Sequence[str]],
     unrouted: pd.DataFrame | None = None,
+    selection: Mapping[str, object] | None = None,
 ) -> tuple[bytes, str, str, dict[str, int]]:
     """Build a clinical CSV plus route-specific Data Retriever manifests."""
     if patients.empty:
@@ -3080,6 +3402,11 @@ def build_filtered_cohort_download(
                 unrouted.to_csv(index=False).encode("utf-8"),
             )
             counts["unrouted_imaging"] = len(unrouted)
+        if selection:
+            archive.writestr(
+                "cohort_selection.json",
+                json.dumps(selection, indent=2, sort_keys=True) + "\n",
+            )
         archive.writestr(
             "README.txt",
             (
@@ -3089,7 +3416,10 @@ def build_filtered_cohort_download(
                 "DICOM, imageUrl routes direct public files, and drs_uri routes authorized "
                 "controlled files. Controlled routes still require approval and API-key "
                 "configuration. The unrouted inventory, when present, is metadata for imaging "
-                "that has no supported Data Retriever route; it is not a download manifest.\n"
+                "that has no supported Data Retriever route; it is not a download manifest. "
+                "Its package_url column identifies the published dataset-level package when "
+                "one is represented. cohort_selection.json records the filters and imaging "
+                "inclusion mode used to prepare this export.\n"
             ),
         )
     return (
