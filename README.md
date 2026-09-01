@@ -67,7 +67,7 @@ python3 scripts/tcia_v2_bundle.py install \
 The app reads the bundle manifest and official install receipt from
 `../tcia-query-skill/cache/tcia-metadata-v2-latest/`. It supports the stable V2
 `full` and `streamlined` contracts (bundle schema 2), Participant Inventory
-schemas 6 and 7, and Snapshot schema 7. Unsupported or incomplete installations
+schemas 6 through 8, and Snapshot schema 7. Unsupported or incomplete installations
 fail with an explicit operator error. Downloads, hashing, SQLite integrity
 checks, and atomic replacement remain the responsibility of the official
 query-skill bundle installer. The startup call is cached once per Streamlit
@@ -87,7 +87,7 @@ direct viewer/access locations, coverage summaries, and review notes. Verbose
 evidence remains in optional audit companions and is not read by the public
 app.
 
-Participant Inventory schema 7 adds geometry status summaries. IDC DICOM
+Participant Inventory schemas 7 and 8 provide geometry status summaries. IDC DICOM
 statuses come from idc-index's separate volume geometry index; eligible
 non-IDC DICOM and single-file volume assets remain `not_checked` until an
 external batch result is imported. The app does not infer geometric coherence

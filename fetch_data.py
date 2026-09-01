@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pyarrow as pa
@@ -49,6 +50,22 @@ STRING_COLUMNS = [
 ]
 
 
+def load_volume_geometry_index(client: Any) -> pd.DataFrame:
+    """Load idc-index's optional geometry table and validate its columns."""
+    client.fetch_index("volume_geometry_index")
+    geometry = getattr(client, "volume_geometry_index", None)
+    if geometry is None or geometry.empty:
+        raise RuntimeError("The current IDC volume geometry index returned no rows.")
+    required = ["SeriesInstanceUID", *IDC_GEOMETRY_COLUMNS]
+    missing = [column for column in required if column not in geometry.columns]
+    if missing:
+        raise RuntimeError(
+            "The current IDC volume geometry index is missing required columns: "
+            + ", ".join(missing)
+        )
+    return geometry[required].copy()
+
+
 def refresh_idc_metadata(output_path: Path, batch_size: int = 20) -> None:
     """Atomically export the complete current IDC series index to Parquet."""
     client = IDCClient.client()
@@ -62,13 +79,7 @@ def refresh_idc_metadata(output_path: Path, batch_size: int = 20) -> None:
     if not collection_ids:
         raise RuntimeError("The current IDC index returned no collections.")
 
-    geometry = client.sql_query(
-        "SELECT SeriesInstanceUID, "
-        + ", ".join(IDC_GEOMETRY_COLUMNS)
-        + " FROM volume_geometry_index"
-    )
-    if geometry is None or geometry.empty:
-        raise RuntimeError("The current IDC volume geometry index returned no rows.")
+    geometry = load_volume_geometry_index(client)
     if geometry["SeriesInstanceUID"].duplicated().any():
         raise RuntimeError("The IDC volume geometry index contains duplicate series UIDs.")
     geometry["SeriesInstanceUID"] = geometry["SeriesInstanceUID"].astype("string")

@@ -27,7 +27,7 @@ SUPPORTED_RELEASE_CONTRACTS = {"full", "streamlined"}
 SUPPORTED_COMPONENTS = {
     "snapshot": {"schema_versions": {7}, "profile": "research_core"},
     "participant_inventory": {
-        "schema_versions": {6, 7},
+        "schema_versions": {6, 7, 8},
         "profile": "research_core",
     },
     "public_non_dicom": {"schema_versions": {7, 8}, "profile": "research_detail"},
@@ -285,6 +285,13 @@ def installed_component(cache_dir: Path, name: str) -> ComponentCache | None:
 def require_installed_component(cache_dir: Path, name: str) -> ComponentCache:
     component = installed_component(cache_dir, name)
     if component is None:
+        # Preserve a precise compatibility error when the official installer
+        # succeeded but the app does not support the published component
+        # contract.  Treat only genuinely absent assets as not installed.
+        installation = load_bundle_installation(cache_dir)
+        contract = (installation.manifest.get("components") or {}).get(name)
+        if isinstance(contract, dict):
+            _validate_component_contract(name, contract)
         profile = str(SUPPORTED_COMPONENTS[name]["profile"])
         raise RuntimeError(
             f"The {name} component is not installed from the current stable V2 bundle. "
