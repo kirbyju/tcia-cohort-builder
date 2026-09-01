@@ -8,6 +8,7 @@ from unittest import mock
 from v2_artifacts import (
     BUNDLE_MANIFEST_ASSET,
     INSTALL_STATE_ASSET,
+    _validate_component_contract,
     ensure_bundle_profile,
     install_bundle_profile,
     installed_component,
@@ -61,6 +62,12 @@ def write_install(cache: Path, bundle: dict, installed_assets=None):
 
 
 class V2ArtifactCacheTests(unittest.TestCase):
+    def test_clinical_schema_eighteen_is_accepted(self):
+        _validate_component_contract(
+            "clinical",
+            {"schema_version": 18, "profile": "research_detail"},
+        )
+
     @mock.patch("v2_artifacts.load_bundle_installation")
     @mock.patch("v2_artifacts.installed_component")
     @mock.patch("v2_artifacts.install_bundle_profile")

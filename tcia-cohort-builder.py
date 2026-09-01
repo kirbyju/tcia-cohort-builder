@@ -1477,15 +1477,29 @@ def main() -> None:
             generated_at_utc,
         ) = prepare_v2_release(str(skill_root), str(v2_cache))
     except Exception as exc:
-        st.error(
-            "The app could not automatically prepare the stable V2 research-detail "
-            "bundle. Check network access, shared-cache permissions, and "
-            "TCIA_QUERY_SKILL_ROOT, then restart the app."
+        compatibility_error = (
+            isinstance(exc, RuntimeError)
+            and str(exc).startswith("Unsupported ")
+            and " schema:" in str(exc)
         )
-        st.code(
-            "python3 scripts/tcia_v2_bundle.py install --profile research_detail",
-            language="bash",
-        )
+        if compatibility_error:
+            st.error(
+                "The installed stable V2 bundle uses a component schema that this "
+                "version of the app does not support. Update tcia-cohort-builder, "
+                "then restart the app; reinstalling the same bundle will not fix "
+                "an app-schema mismatch."
+            )
+            st.code("git pull --ff-only", language="bash")
+        else:
+            st.error(
+                "The app could not automatically prepare the stable V2 research-detail "
+                "bundle. Check network access, shared-cache permissions, and "
+                "TCIA_QUERY_SKILL_ROOT, then restart the app."
+            )
+            st.code(
+                "python3 scripts/tcia_v2_bundle.py install --profile research_detail",
+                language="bash",
+            )
         st.exception(exc)
         st.stop()
     # All release artifacts are resolved from one official stable V2 install.

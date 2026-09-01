@@ -75,7 +75,7 @@ server process rather than repeated on widget reruns or for each browser
 session.
 
 The consumer accepts public non-DICOM schemas 7 and 8, controlled-access schema
-2, and clinical schema 17. It does not read preview caches or
+2, and clinical schemas 17-18. It does not read preview caches or
 `tcia-snapshot-latest` compatibility caches during V2 integration.
 
 The compact Participant Inventory reports clinical availability but does not

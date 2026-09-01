@@ -32,7 +32,7 @@ SUPPORTED_COMPONENTS = {
     },
     "public_non_dicom": {"schema_versions": {7, 8}, "profile": "research_detail"},
     "controlled_access": {"schema_versions": {2}, "profile": "research_detail"},
-    "clinical": {"schema_versions": {17}, "profile": "research_detail"},
+    "clinical": {"schema_versions": {17, 18}, "profile": "research_detail"},
 }
 SUPPORTED_INSTALL_PROFILES = {"research_core", "research_detail", "audit_support"}
 PROFILE_COMPONENTS = {
