@@ -1205,6 +1205,61 @@ class CohortBuilderDataTests(unittest.TestCase):
             {"TCGA-LGG", "BraTS-TCGA-LGG"},
         )
 
+    def test_inventory_source_links_group_crosswalk_and_multiple_collections(self):
+        patients = pd.DataFrame(
+            [
+                {
+                    "patient_key": "ACRIN-6698|ACRIN-6698-102212",
+                    "short_title": "ACRIN-6698",
+                    "dataset_type": "Collection",
+                    "subject_id": "ACRIN-6698-102212",
+                    "has_clinical": True,
+                },
+                {
+                    "patient_key": "ISPY2|ISPY2-102212",
+                    "short_title": "ISPY2",
+                    "dataset_type": "Collection",
+                    "subject_id": "ISPY2-102212",
+                    "has_clinical": True,
+                },
+                {
+                    "patient_key": "BreastDCEDL_ISPY2|ACRIN-6698-102212",
+                    "short_title": "BreastDCEDL_ISPY2",
+                    "dataset_type": "Analysis Result",
+                    "subject_id": "ACRIN-6698-102212",
+                    "linked_source_participant_keys_json": json.dumps(
+                        [
+                            "ACRIN-6698|ACRIN-6698-102212",
+                            "ISPY2|ISPY2-102212",
+                        ]
+                    ),
+                    "has_clinical": False,
+                },
+                {
+                    "patient_key": "NLST|102212",
+                    "short_title": "NLST",
+                    "dataset_type": "Collection",
+                    "subject_id": "102212",
+                    "has_clinical": True,
+                },
+            ]
+        )
+
+        grouped, memberships = build_grouped_patient_index(patients)
+
+        self.assertEqual(len(grouped), 2)
+        combined = grouped[grouped["dataset_count"] == 3].iloc[0]
+        self.assertEqual(
+            set(json.loads(combined["member_short_titles_json"])),
+            {"ACRIN-6698", "ISPY2", "BreastDCEDL_ISPY2"},
+        )
+        linked_members = memberships[
+            memberships["patient_group_key"] == combined["patient_group_key"]
+        ]
+        self.assertEqual(len(linked_members), 3)
+        nlst = memberships[memberships["short_title"] == "NLST"].iloc[0]
+        self.assertNotEqual(nlst["patient_group_key"], combined["patient_group_key"])
+
     def test_explicit_relationship_requires_exact_subject_and_one_source(self):
         patients = pd.DataFrame(
             [

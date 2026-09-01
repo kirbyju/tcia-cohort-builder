@@ -61,7 +61,7 @@ from v2_artifacts import (
 )
 
 
-PATIENT_INDEX_SCHEMA_VERSION = 14
+PATIENT_INDEX_SCHEMA_VERSION = 15
 APP_DIR = Path(__file__).resolve().parent
 BRAND_SKILL_DIR = Path.home() / ".codex" / "skills" / "tcia-brand-guidelines"
 LOGO_PATH = BRAND_SKILL_DIR / "assets" / "tcia-logo-dark.svg"
@@ -1587,7 +1587,7 @@ def main() -> None:
     if access:
         working = working[working["resolved_access_level"].isin(access)]
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     data_categories = c1.multiselect(
         "Data category",
         token_options(working, "data_categories"),
@@ -1606,35 +1606,6 @@ def main() -> None:
         key="draft_file_formats",
         help="Physical encoding such as DICOM, NIfTI, MHA, SVS, CSV, or MPG.",
     )
-    geometry = c4.segmented_control(
-        "Image geometry",
-        GEOMETRY_FILTER_OPTIONS,
-        default="Any",
-        required=True,
-        key="draft_geometry",
-        help=(
-            "Filters individual series and files by assessed grid or volume regularity. "
-            "Any includes unchecked, indeterminate, out-of-scope, and non-volume data. "
-            "Regular includes items that passed an available geometry assessment. "
-            "Irregular includes items with a known failed geometry check. Geometry "
-            "assessment does not establish image quality or clinical usability."
-        ),
-    )
-    facet_memberships = scoped_memberships
-    if datasets:
-        facet_memberships = facet_memberships[
-            facet_memberships["short_title"].isin(datasets)
-        ]
-    working = filter_patient_groups_by_asset_facets(
-        working,
-        facet_memberships,
-        participant_asset_facets,
-        data_categories=data_categories,
-        data_types=data_types,
-        file_formats=file_formats,
-        geometry=str(geometry),
-    )
-
     imaging_contents = st.segmented_control(
         "Imaging & download contents",
         ("All available imaging", "Only imaging matching filters"),
@@ -1650,10 +1621,42 @@ def main() -> None:
         ),
     )
 
-    with st.expander("Advanced clinical and imaging filters", expanded=False):
-        st.markdown("**Imaging detail**")
+    facet_memberships = scoped_memberships
+    if datasets:
+        facet_memberships = facet_memberships[
+            facet_memberships["short_title"].isin(datasets)
+        ]
+
+    body_parts: list[str] = []
+    multiple_imaging_dates = False
+    pathology_values: dict[str, list[str]] = {}
+    geometry = "Any"
+    with st.expander("Advanced imaging filters", expanded=False):
+        geometry = st.segmented_control(
+            "Image geometry",
+            GEOMETRY_FILTER_OPTIONS,
+            default="Any",
+            required=True,
+            key="draft_geometry",
+            help=(
+                "Filters individual series and files by assessed grid or volume regularity. "
+                "Any includes unchecked, indeterminate, out-of-scope, and non-volume data. "
+                "Regular includes items that passed an available geometry assessment. "
+                "Irregular includes items with a known failed geometry check. Geometry "
+                "assessment does not establish image quality or clinical usability."
+            ),
+        )
+        working = filter_patient_groups_by_asset_facets(
+            working,
+            facet_memberships,
+            participant_asset_facets,
+            data_categories=data_categories,
+            data_types=data_types,
+            file_formats=file_formats,
+            geometry=str(geometry),
+        )
         body_parts = st.multiselect(
-            "Body part",
+            "Body Part Examined",
             token_options(working, "body_parts"),
             key="draft_body_parts",
             help=(
@@ -1665,19 +1668,15 @@ def main() -> None:
         working = apply_token_filter(working, "body_parts", body_parts)
 
         multiple_imaging_dates = st.toggle(
-            "Multiple imaging dates",
+            "Require multiple imaging dates",
             key="draft_multiple_imaging_dates",
-            help=(
-                "Keep patients with public DICOM on at least two distinct IDC StudyDate values. "
-                "Distinct dates are an imaging-time-point proxy, not a curated visit definition."
-            ),
+            help="Only include participants with multiple imaging timepoints.",
         )
         if multiple_imaging_dates:
             working = working[
                 working["has_multiple_imaging_dates"].fillna(False).astype(bool)
             ]
 
-        pathology_values: dict[str, list[str]] = {}
         if "Pathology" in data_categories:
             st.markdown("**Pathology**")
             p1, p2 = st.columns(2)
@@ -1708,10 +1707,10 @@ def main() -> None:
                 pathology_values[column] = selected
                 working = apply_token_filter(working, column, selected)
 
-        st.markdown("**Clinical**")
-        clinical_values: dict[str, list[str]] = {}
-        age_at_imaging_range = (0, 120)
-        include_inferred_clinical = True
+    clinical_values: dict[str, list[str]] = {}
+    age_at_imaging_range = (0, 120)
+    include_inferred_clinical = True
+    with st.expander("Advanced clinical filters", expanded=False):
         if not paths.clinical_db.exists():
             st.caption("Startup preparation did not provide clinical detail.")
             render_detail_install_notice(
@@ -1808,7 +1807,7 @@ def main() -> None:
             ("Access", [access_label(value) for value in access]),
             ("Data category", data_categories),
             ("Data type", data_types),
-            ("Body part", body_parts),
+            ("Body Part Examined", body_parts),
             ("File format", file_formats),
             ("Image geometry", "" if geometry == "Any" else geometry),
             (

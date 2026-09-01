@@ -1553,6 +1553,40 @@ def _load_participant_search_index(path: Path | None) -> pd.DataFrame:
         """,
     )
     result = participants.merge(asset_counts, on="participant_key", how="left")
+    source_links_object = preferred_object(path, "agent_participant_source_links")
+    if source_links_object is not None:
+        source_links = read_sql(
+            path,
+            f"""
+            SELECT analysis_result_participant_key,
+                   source_collection_participant_key
+            FROM {source_links_object}
+            WHERE link_status = 'linked_source_collection'
+              AND COALESCE(TRIM(source_collection_participant_key), '') <> ''
+            """,
+        )
+        if not source_links.empty:
+            source_links = (
+                source_links.groupby(
+                    "analysis_result_participant_key", sort=False
+                )["source_collection_participant_key"]
+                .agg(
+                    lambda values: json.dumps(
+                        list(dict.fromkeys(str(value) for value in values)),
+                        separators=(",", ":"),
+                    )
+                )
+                .rename("linked_source_participant_keys_json")
+                .reset_index()
+            )
+            result = result.merge(
+                source_links,
+                left_on="participant_key",
+                right_on="analysis_result_participant_key",
+                how="left",
+            ).drop(columns="analysis_result_participant_key")
+    if "linked_source_participant_keys_json" not in result:
+        result["linked_source_participant_keys_json"] = pd.NA
     for column in (
         "has_open_data", "has_controlled_data", "has_public_dicom",
         "has_public_non_dicom", "has_clinical", "has_annotations",
@@ -1895,9 +1929,10 @@ def build_grouped_patient_index(
     """Group verified Collection/Analysis Result memberships for presentation.
 
     The returned membership frame preserves every dataset-scoped source row.
-    Grouping is allowed when IDC supplies the same collection identifier and
-    normalized PatientID, or when an Analysis Result explicitly names one
-    source Collection in WordPress and the normalized PatientID matches exactly.
+    Grouping is allowed when the Participant Inventory supplies a trusted
+    participant-source link, IDC supplies the same collection identifier and
+    normalized PatientID, or an Analysis Result explicitly names one source
+    Collection in WordPress and the normalized PatientID matches exactly.
     """
     if frame.empty:
         empty = frame.copy()
@@ -1972,6 +2007,67 @@ def build_grouped_patient_index(
             members.at[row.Index, "patient_group_key"] = next(
                 iter(matched_group_keys)
             )
+
+    # Schema-8 Participant Inventory links are the authoritative relationship
+    # surface. Unite every explicitly linked Analysis Result and source
+    # Collection participant, including reviewed crosswalks whose identifiers
+    # differ and results linked to more than one source Collection. Existing
+    # IDC/WordPress groups become graph edges too, so the final components are
+    # stable regardless of which relationship established the first grouping.
+    patient_keys = set(members["patient_key"].astype(str))
+    parent = {key: key for key in patient_keys}
+
+    def find(key: str) -> str:
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[max(left_root, right_root)] = min(left_root, right_root)
+
+    for _, group in members.groupby("patient_group_key", sort=False):
+        keys = list(dict.fromkeys(group["patient_key"].astype(str)))
+        for key in keys[1:]:
+            union(keys[0], key)
+
+    if "linked_source_participant_keys_json" in members:
+        for row in members.itertuples(index=False):
+            analysis_key = str(row.patient_key)
+            encoded = getattr(row, "linked_source_participant_keys_json", None)
+            if not _present(encoded):
+                continue
+            try:
+                source_keys = json.loads(str(encoded))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(source_keys, list):
+                continue
+            for source_key in source_keys:
+                source_key = str(source_key)
+                if source_key in patient_keys:
+                    union(analysis_key, source_key)
+
+    components: dict[str, list[str]] = {}
+    for key in patient_keys:
+        components.setdefault(find(key), []).append(key)
+    collection_keys = set(
+        members.loc[
+            members["dataset_type"] == "Collection", "patient_key"
+        ].astype(str)
+    )
+    group_key_by_patient: dict[str, str] = {}
+    for component in components.values():
+        preferred = sorted(collection_keys.intersection(component))
+        group_key = preferred[0] if preferred else sorted(component)[0]
+        for key in component:
+            group_key_by_patient[key] = group_key
+    members["patient_group_key"] = members["patient_key"].astype(str).map(
+        group_key_by_patient
+    )
 
     type_rank = members.get("dataset_type", "").map(
         lambda value: 0 if value == "Collection" else 1
