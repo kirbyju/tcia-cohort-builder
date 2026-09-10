@@ -533,6 +533,42 @@ def geometry_matches(row: Mapping[str, object], selected: str) -> bool:
     return bool(statuses & IRREGULAR_GEOMETRY_STATUSES) or irregular_count > 0
 
 
+def geometry_match_mask(frame: pd.DataFrame, selected: str) -> pd.Series:
+    """Vectorized geometry predicate for cohort-scale asset filtering."""
+    if selected == "Any":
+        return pd.Series(True, index=frame.index)
+    if selected not in GEOMETRY_FILTER_OPTIONS:
+        raise ValueError(f"Unsupported geometry filter: {selected}")
+
+    statuses = pd.Series("", index=frame.index, dtype="object")
+    for column in ("geometry_status", "geometry_statuses"):
+        if column in frame:
+            statuses = (
+                statuses
+                + ";"
+                + frame[column].fillna("").astype(str).str.casefold()
+            )
+    wanted_statuses = (
+        REGULAR_GEOMETRY_STATUSES
+        if selected == "Regular"
+        else IRREGULAR_GEOMETRY_STATUSES
+    )
+    status_match = pd.Series(False, index=frame.index)
+    for status in wanted_statuses:
+        status_match |= statuses.str.contains(status, regex=False)
+
+    count_column = (
+        "geometry_regular_count"
+        if selected == "Regular"
+        else "geometry_not_regular_count"
+    )
+    counts = pd.to_numeric(
+        frame.get(count_column, pd.Series(0, index=frame.index)),
+        errors="coerce",
+    ).fillna(0)
+    return status_match | counts.gt(0)
+
+
 def add_idc_imaging_facets(frame: pd.DataFrame) -> pd.DataFrame:
     """Add normalized file/category/type and geometry fields to IDC series rows."""
     if frame.empty:
@@ -584,31 +620,42 @@ def filter_imaging_rows(
     """Apply OR-within/AND-across facets to individual imaging rows."""
     if frame.empty:
         return frame.copy()
-    result = frame.copy()
+    result = frame
     wanted_categories = {str(value).casefold() for value in data_categories}
     if wanted_categories:
-        result = result[
-            result.apply(
-                lambda row: bool(imaging_row_categories(row) & wanted_categories),
-                axis=1,
+        if "data_category" in result:
+            result = _filter_export_tokens(
+                result, "data_category", data_categories
             )
-        ]
+        else:
+            result = result[
+                result.apply(
+                    lambda row: bool(
+                        imaging_row_categories(row) & wanted_categories
+                    ),
+                    axis=1,
+                )
+            ]
     wanted_types = {
         canonical_imaging_token(value).casefold() for value in data_types
     }
     if wanted_types and not result.empty:
-        result = result[
-            result.apply(
-                lambda row: bool(imaging_row_data_types(row) & wanted_types), axis=1
-            )
-        ]
+        if "data_type" in result:
+            result = _filter_export_tokens(result, "data_type", data_types)
+        else:
+            result = result[
+                result.apply(
+                    lambda row: bool(
+                        imaging_row_data_types(row) & wanted_types
+                    ),
+                    axis=1,
+                )
+            ]
     result = _filter_export_tokens(result, "file_format", file_formats)
     result = _filter_export_tokens(result, "modality", modalities)
     result = _filter_export_tokens(result, "body_part_examined", body_parts)
     if geometry != "Any" and not result.empty:
-        result = result[
-            result.apply(lambda row: geometry_matches(row, geometry), axis=1)
-        ]
+        result = result[geometry_match_mask(result, geometry)]
     return result.copy()
 
 
@@ -1252,7 +1299,9 @@ def filter_patient_groups_by_asset_facets(
     if patients.empty or not any(
         (data_categories, data_types, file_formats, geometry != "Any")
     ):
-        return patients.copy()
+        # Callers treat the shared search index as immutable. Avoid duplicating
+        # the full frame when no asset-grain filter is active.
+        return patients
     if assets.empty or memberships.empty:
         return patients.iloc[0:0].copy()
     visible_groups = set(patients["patient_group_key"].astype(str))

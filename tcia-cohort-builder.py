@@ -70,6 +70,52 @@ OFFICIAL_LOGO_URL = (
     "TCIA-Logo-01.svg"
 )
 PATIENT_RESULTS_PAGE_SIZES = (25, 50, 100, 250)
+FILTER_DEFAULTS = {
+    "draft_search": "",
+    "draft_dataset_type": "All",
+    "draft_datasets": [],
+    "draft_access": [],
+    "draft_data_categories": [],
+    "draft_data_types": [],
+    "draft_file_formats": [],
+    "draft_imaging_contents": "All available imaging",
+    "draft_geometry": "Any",
+    "draft_body_parts": [],
+    "draft_multiple_imaging_dates": False,
+    "draft_pathology_protocols": [],
+    "draft_pathology_magnifications": [],
+    "draft_include_inferred_clinical": True,
+    "draft_age_at_imaging": (0, 120),
+    "draft_diagnosis": [],
+    "draft_site": [],
+    "draft_sex": [],
+    "draft_vital": [],
+}
+BASIC_FILTER_KEYS = (
+    "draft_search",
+    "draft_dataset_type",
+    "draft_datasets",
+    "draft_access",
+    "draft_data_categories",
+    "draft_data_types",
+    "draft_file_formats",
+    "draft_imaging_contents",
+)
+IMAGING_FILTER_KEYS = (
+    "draft_geometry",
+    "draft_body_parts",
+    "draft_multiple_imaging_dates",
+    "draft_pathology_protocols",
+    "draft_pathology_magnifications",
+)
+CLINICAL_FILTER_KEYS = (
+    "draft_include_inferred_clinical",
+    "draft_age_at_imaging",
+    "draft_diagnosis",
+    "draft_site",
+    "draft_sex",
+    "draft_vital",
+)
 
 
 st.set_page_config(
@@ -173,12 +219,31 @@ st.markdown(
 )
 
 
-@st.cache_data(show_spinner="Building the patient-level index…")
+@st.cache_resource(
+    show_spinner="Building the patient-level index…", max_entries=1
+)
 def cached_patient_views(
     paths: DataPaths, signatures: tuple
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, tuple[str, ...]]]:
     patients = build_patient_index(paths)
-    return build_grouped_patient_index(patients)
+    grouped, memberships = build_grouped_patient_index(patients)
+    grouped["_search_text"] = (
+        grouped["dataset_memberships"].fillna("").astype(str)
+        + "\n"
+        + grouped["subject_id"].fillna("").astype(str)
+        + "\n"
+        + grouped.get("title", pd.Series("", index=grouped.index))
+        .fillna("")
+        .astype(str)
+    ).str.casefold()
+    filter_options = {
+        "datasets": tuple(option_values(memberships, "short_title")),
+        "access": tuple(option_values(grouped, "resolved_access_level")),
+        "data_categories": tuple(token_options(grouped, "data_categories")),
+        "data_types": tuple(token_options(grouped, "data_types")),
+        "file_formats": tuple(token_options(grouped, "file_formats")),
+    }
+    return grouped, memberships, filter_options
 
 
 @st.cache_data(show_spinner=False)
@@ -186,7 +251,7 @@ def cached_catalog(paths: DataPaths, signatures: tuple) -> pd.DataFrame:
     return load_dataset_catalog(paths.snapshot_db)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=1)
 def cached_participant_asset_facets(
     paths: DataPaths, signatures: tuple
 ) -> pd.DataFrame:
@@ -307,29 +372,55 @@ def finish_cart_add(added: int) -> None:
     st.rerun()
 
 
+def _filter_value(value: object) -> object:
+    """Copy mutable filter values before storing them in Session State."""
+    return list(value) if isinstance(value, list) else value
+
+
+def applied_filter_key(draft_key: str) -> str:
+    return draft_key.replace("draft_", "applied_", 1)
+
+
+def initialize_filter_state() -> None:
+    for draft_key, default in FILTER_DEFAULTS.items():
+        applied_key = applied_filter_key(draft_key)
+        st.session_state.setdefault(applied_key, _filter_value(default))
+    for draft_key in BASIC_FILTER_KEYS:
+        st.session_state.setdefault(
+            draft_key,
+            _filter_value(st.session_state[applied_filter_key(draft_key)]),
+        )
+
+
+def apply_filter_drafts(keys: tuple[str, ...]) -> None:
+    for draft_key in keys:
+        st.session_state[applied_filter_key(draft_key)] = _filter_value(
+            st.session_state.get(draft_key, FILTER_DEFAULTS[draft_key])
+        )
+    reset_patient_results_page()
+    st.session_state.pop("selected_patient_key", None)
+
+
+def applied_filter(draft_key: str) -> object:
+    return st.session_state.get(
+        applied_filter_key(draft_key), FILTER_DEFAULTS[draft_key]
+    )
+
+
+def lazy_widget_default(draft_key: str, parameter: str) -> dict[str, object]:
+    """Seed a lazily rendered widget without conflicting with live widget state."""
+    if draft_key in st.session_state:
+        return {}
+    return {parameter: _filter_value(applied_filter(draft_key))}
+
+
 def clear_filters() -> None:
-    st.session_state["draft_search"] = ""
-    st.session_state["draft_dataset_type"] = "All"
-    for key in (
-        "draft_datasets",
-        "draft_access",
-        "draft_data_categories",
-        "draft_data_types",
-        "draft_body_parts",
-        "draft_file_formats",
-        "draft_pathology_protocols",
-        "draft_pathology_magnifications",
-        "draft_diagnosis",
-        "draft_site",
-        "draft_sex",
-        "draft_vital",
-    ):
-        st.session_state[key] = []
-    st.session_state["draft_age_at_imaging"] = (0, 120)
-    st.session_state["draft_multiple_imaging_dates"] = False
-    st.session_state["draft_geometry"] = "Any"
-    st.session_state["draft_imaging_contents"] = "All available imaging"
-    st.session_state["draft_include_inferred_clinical"] = True
+    for draft_key, default in FILTER_DEFAULTS.items():
+        st.session_state[applied_filter_key(draft_key)] = _filter_value(default)
+        if draft_key in BASIC_FILTER_KEYS:
+            st.session_state[draft_key] = _filter_value(default)
+        else:
+            st.session_state.pop(draft_key, None)
     st.session_state["draft_conflicts"] = False
     st.session_state["patient_results_page"] = 1
     st.session_state.pop("selected_patient_key", None)
@@ -470,7 +561,44 @@ def render_filtered_cohort_export(
     geometry: str,
     imaging_contents: str,
 ) -> None:
-    with st.expander("Download filtered cohort", expanded=False):
+    export_expander = st.expander(
+        "Download filtered cohort",
+        expanded=False,
+        key="download_filtered_cohort",
+        on_change="rerun",
+    )
+    if export_expander.open:
+        with export_expander:
+            _render_filtered_cohort_export_contents(
+                paths,
+                catalog,
+                patients,
+                membership_rows,
+                selected_datasets,
+                data_categories,
+                data_types,
+                file_formats,
+                body_parts,
+                geometry,
+                imaging_contents,
+            )
+
+
+def _render_filtered_cohort_export_contents(
+    paths: DataPaths,
+    catalog: pd.DataFrame,
+    patients: pd.DataFrame,
+    membership_rows: pd.DataFrame,
+    selected_datasets: list[str],
+    data_categories: list[str],
+    data_types: list[str],
+    file_formats: list[str],
+    body_parts: list[str],
+    geometry: str,
+    imaging_contents: str,
+) -> None:
+    """Render export preparation only while its dynamic expander is open."""
+    with st.container():
         include_related = False
         if selected_datasets:
             include_related = st.checkbox(
@@ -1536,7 +1664,9 @@ def main() -> None:
         st.stop()
 
     try:
-        patients, membership_rows = cached_patient_views(paths, cache_key)
+        patients, membership_rows, filter_options = cached_patient_views(
+            paths, cache_key
+        )
         catalog = cached_catalog(paths, signatures)
         participant_asset_facets = cached_participant_asset_facets(paths, signatures)
     except Exception as exc:
@@ -1554,112 +1684,206 @@ def main() -> None:
     )
 
     st.markdown("<div class='section-label'>Cohort controls</div>", unsafe_allow_html=True)
-    st.session_state.setdefault("draft_dataset_type", "All")
-    dataset_type = st.segmented_control(
-        "Dataset type",
-        DATASET_TYPE_FILTERS,
-        required=True,
-        format_func=lambda value: {
-            "All": "All",
-            "Collection": "Collections",
-            "Analysis Result": "Analysis results",
-        }[value],
-        key="draft_dataset_type",
-    )
-    scoped_patients, scoped_memberships = filter_patient_groups_by_dataset_type(
-        patients,
-        membership_rows,
-        str(dataset_type),
-    )
-    f1, f2, f3 = st.columns([1.5, 1.1, .8])
-    search = f1.text_input("Search", placeholder="Dataset or patient ID", key="draft_search").strip()
-    datasets = f2.multiselect(
-        "Dataset",
-        option_values(scoped_memberships, "short_title"),
-        key="draft_datasets",
-    )
-    access = f3.multiselect("Access", option_values(patients, "resolved_access_level"), format_func=access_label, key="draft_access")
+    initialize_filter_state()
+    with st.form("cohort_filters", border=True):
+        st.segmented_control(
+            "Dataset type",
+            DATASET_TYPE_FILTERS,
+            required=True,
+            format_func=lambda value: {
+                "All": "All",
+                "Collection": "Collections",
+                "Analysis Result": "Analysis results",
+            }[value],
+            key="draft_dataset_type",
+        )
+        f1, f2, f3 = st.columns([1.5, 1.1, .8])
+        f1.text_input(
+            "Search", placeholder="Dataset or patient ID", key="draft_search"
+        )
+        f2.multiselect(
+            "Dataset", filter_options["datasets"], key="draft_datasets"
+        )
+        f3.multiselect(
+            "Access",
+            filter_options["access"],
+            format_func=access_label,
+            key="draft_access",
+        )
+        c1, c2, c3 = st.columns(3)
+        c1.multiselect(
+            "Data category",
+            filter_options["data_categories"],
+            key="draft_data_categories",
+            help="Broad content category aligned with TCIA WordPress download labels.",
+        )
+        c2.multiselect(
+            "Data type",
+            filter_options["data_types"],
+            key="draft_data_types",
+            help="Specific modality or content type, such as CT, MR, Segmentation, or Whole Slide Image.",
+        )
+        c3.multiselect(
+            "File format",
+            filter_options["file_formats"],
+            key="draft_file_formats",
+            help="Physical encoding such as DICOM, NIfTI, MHA, SVS, CSV, or MPG.",
+        )
+        st.segmented_control(
+            "Imaging & download contents",
+            ("All available imaging", "Only imaging matching filters"),
+            required=True,
+            key="draft_imaging_contents",
+            help=(
+                "Controls both Imaging & Files results and the cohort package after matching "
+                "participants are found. All available imaging includes every linked imaging "
+                "item in the selected dataset scope. Only imaging matching filters includes "
+                "series and files satisfying the selected imaging filters. Items without an "
+                "individual route remain inventory-only."
+            ),
+        )
+        basic_submitted = st.form_submit_button(
+            "Apply cohort filters", type="primary"
+        )
+    if basic_submitted:
+        apply_filter_drafts(BASIC_FILTER_KEYS)
 
-    working = scoped_patients.copy()
+    dataset_type = str(applied_filter("draft_dataset_type"))
+    search = str(applied_filter("draft_search")).strip()
+    datasets = list(applied_filter("draft_datasets"))
+    access = list(applied_filter("draft_access"))
+    data_categories = list(applied_filter("draft_data_categories"))
+    data_types = list(applied_filter("draft_data_types"))
+    file_formats = list(applied_filter("draft_file_formats"))
+    imaging_contents = str(applied_filter("draft_imaging_contents"))
+
+    scoped_patients, scoped_memberships = filter_patient_groups_by_dataset_type(
+        patients, membership_rows, dataset_type
+    )
+    valid_datasets = set(scoped_memberships["short_title"].astype(str))
+    datasets = [value for value in datasets if value in valid_datasets]
+    working = scoped_patients
     if search:
-        pattern = search.casefold()
         working = working[
-            working["dataset_memberships"].astype(str).str.casefold().str.contains(pattern, regex=False)
-            | working["subject_id"].astype(str).str.casefold().str.contains(pattern, regex=False)
-            | working.get("title", "").astype(str).str.casefold().str.contains(pattern, regex=False)
+            working["_search_text"].str.contains(search.casefold(), regex=False)
         ]
     if datasets:
-        wanted_datasets = set(datasets)
+        matching_groups = set(
+            scoped_memberships.loc[
+                scoped_memberships["short_title"].isin(datasets),
+                "patient_group_key",
+            ].astype(str)
+        )
         working = working[
-            working.apply(
-                lambda row: bool(
-                    wanted_datasets.intersection(member_short_titles(row))
-                ),
-                axis=1,
-            )
+            working["patient_group_key"].astype(str).isin(matching_groups)
         ]
     if access:
         working = working[working["resolved_access_level"].isin(access)]
-
-    c1, c2, c3 = st.columns(3)
-    data_categories = c1.multiselect(
-        "Data category",
-        token_options(working, "data_categories"),
-        key="draft_data_categories",
-        help="Broad content category aligned with TCIA WordPress download labels.",
-    )
-    data_types = c2.multiselect(
-        "Data type",
-        token_options(working, "data_types"),
-        key="draft_data_types",
-        help="Specific modality or content type, such as CT, MR, Segmentation, or Whole Slide Image.",
-    )
-    file_formats = c3.multiselect(
-        "File format",
-        token_options(working, "file_formats"),
-        key="draft_file_formats",
-        help="Physical encoding such as DICOM, NIfTI, MHA, SVS, CSV, or MPG.",
-    )
-    imaging_contents = st.segmented_control(
-        "Imaging & download contents",
-        ("All available imaging", "Only imaging matching filters"),
-        default="All available imaging",
-        required=True,
-        key="draft_imaging_contents",
-        help=(
-            "Controls both Imaging & Files results and the cohort package after matching "
-            "participants are found. All available imaging includes every linked imaging "
-            "item in the selected dataset scope. Only imaging matching filters includes "
-            "series and files satisfying the selected imaging filters. Items without an "
-            "individual route remain inventory-only."
-        ),
-    )
 
     facet_memberships = scoped_memberships
     if datasets:
         facet_memberships = facet_memberships[
             facet_memberships["short_title"].isin(datasets)
         ]
+    working = filter_patient_groups_by_asset_facets(
+        working,
+        facet_memberships,
+        participant_asset_facets,
+        data_categories=data_categories,
+        data_types=data_types,
+        file_formats=file_formats,
+    )
 
-    body_parts: list[str] = []
-    multiple_imaging_dates = False
-    pathology_values: dict[str, list[str]] = {}
-    geometry = "Any"
-    with st.expander("Advanced imaging filters", expanded=False):
-        geometry = st.segmented_control(
-            "Image geometry",
-            GEOMETRY_FILTER_OPTIONS,
-            default="Any",
-            required=True,
-            key="draft_geometry",
-            help=(
-                "Filters individual series and files by assessed grid or volume regularity. "
-                "Any includes unchecked, indeterminate, out-of-scope, and non-volume data. "
-                "Regular includes items that passed an available geometry assessment. "
-                "Irregular includes items with a known failed geometry check. Geometry "
-                "assessment does not establish image quality or clinical usability."
-            ),
-        )
+    imaging_expander = st.expander(
+        "Advanced imaging filters",
+        expanded=False,
+        key="advanced_imaging_filters",
+        on_change="rerun",
+    )
+    if imaging_expander.open:
+        with imaging_expander:
+            with st.form("advanced_imaging_filter_form", border=False):
+                st.segmented_control(
+                    "Image geometry",
+                    GEOMETRY_FILTER_OPTIONS,
+                    required=True,
+                    key="draft_geometry",
+                    **lazy_widget_default("draft_geometry", "default"),
+                    help=(
+                        "Filters individual series and files by assessed grid or volume regularity. "
+                        "Any includes unchecked, indeterminate, out-of-scope, and non-volume data. "
+                        "Regular includes items that passed an available geometry assessment. "
+                        "Irregular includes items with a known failed geometry check. Geometry "
+                        "assessment does not establish image quality or clinical usability."
+                    ),
+                )
+                st.multiselect(
+                    "Body Part Examined",
+                    token_options(working, "body_parts"),
+                    key="draft_body_parts",
+                    **lazy_widget_default("draft_body_parts", "default"),
+                    help=(
+                        "The cohort-wide filter uses DICOM BodyPartExamined values from IDC. "
+                        "File-level anatomy from public non-DICOM detail appears after drill-down "
+                        "and is not added to this global filter."
+                    ),
+                )
+                st.toggle(
+                    "Require multiple imaging dates",
+                    key="draft_multiple_imaging_dates",
+                    **lazy_widget_default(
+                        "draft_multiple_imaging_dates", "value"
+                    ),
+                    help="Only include participants with multiple imaging timepoints.",
+                )
+                if "Pathology" in data_categories:
+                    st.markdown("**Pathology**")
+                    p1, p2 = st.columns(2)
+                    p1.multiselect(
+                        "Protocol or stain",
+                        token_options(working, "pathology_protocols"),
+                        key="draft_pathology_protocols",
+                        **lazy_widget_default(
+                            "draft_pathology_protocols", "default"
+                        ),
+                        help=(
+                            "Participant-linked public non-DICOM metadata only; "
+                            "dataset-level files without a patient crosswalk are not assigned."
+                        ),
+                    )
+                    p2.multiselect(
+                        "Magnification",
+                        token_options(working, "pathology_magnifications"),
+                        key="draft_pathology_magnifications",
+                        **lazy_widget_default(
+                            "draft_pathology_magnifications", "default"
+                        ),
+                    )
+                imaging_submitted = st.form_submit_button(
+                    "Apply imaging filters", type="primary"
+                )
+        if imaging_submitted:
+            apply_filter_drafts(IMAGING_FILTER_KEYS)
+
+    geometry = str(applied_filter("draft_geometry"))
+    body_parts = list(applied_filter("draft_body_parts"))
+    multiple_imaging_dates = bool(
+        applied_filter("draft_multiple_imaging_dates")
+    )
+    pathology_values = {
+        "pathology_protocols": list(
+            applied_filter("draft_pathology_protocols")
+        ),
+        "pathology_magnifications": list(
+            applied_filter("draft_pathology_magnifications")
+        ),
+    }
+    if "Pathology" not in data_categories:
+        pathology_values = {
+            "pathology_protocols": [],
+            "pathology_magnifications": [],
+        }
+    if geometry != "Any":
         working = filter_patient_groups_by_asset_facets(
             working,
             facet_memberships,
@@ -1667,138 +1891,116 @@ def main() -> None:
             data_categories=data_categories,
             data_types=data_types,
             file_formats=file_formats,
-            geometry=str(geometry),
+            geometry=geometry,
         )
-        body_parts = st.multiselect(
-            "Body Part Examined",
-            token_options(working, "body_parts"),
-            key="draft_body_parts",
-            help=(
-                "The cohort-wide filter uses DICOM BodyPartExamined values from IDC. "
-                "File-level anatomy from public non-DICOM detail appears after drill-down "
-                "and is not added to this global filter."
-            ),
-        )
-        working = apply_token_filter(working, "body_parts", body_parts)
+    working = apply_token_filter(working, "body_parts", body_parts)
+    if multiple_imaging_dates:
+        working = working[
+            working["has_multiple_imaging_dates"].fillna(False).astype(bool)
+        ]
+    for column, selected in pathology_values.items():
+        working = apply_token_filter(working, column, selected)
 
-        multiple_imaging_dates = st.toggle(
-            "Require multiple imaging dates",
-            key="draft_multiple_imaging_dates",
-            help="Only include participants with multiple imaging timepoints.",
-        )
-        if multiple_imaging_dates:
-            working = working[
-                working["has_multiple_imaging_dates"].fillna(False).astype(bool)
-            ]
-
-        if "Pathology" in data_categories:
-            st.markdown("**Pathology**")
-            p1, p2 = st.columns(2)
-            pathology_filters = [
-                (
-                    p1,
-                    "Protocol or stain",
-                    "pathology_protocols",
-                    "draft_pathology_protocols",
-                ),
-                (
-                    p2,
-                    "Magnification",
-                    "pathology_magnifications",
-                    "draft_pathology_magnifications",
-                ),
-            ]
-            for container, label, column, key in pathology_filters:
-                selected = container.multiselect(
-                    label,
-                    token_options(working, column),
-                    key=key,
-                    help=(
-                        "Participant-linked public non-DICOM metadata only; "
-                        "dataset-level files without a patient crosswalk are not assigned."
-                    ),
+    clinical_expander = st.expander(
+        "Advanced clinical filters",
+        expanded=False,
+        key="advanced_clinical_filters",
+        on_change="rerun",
+    )
+    if clinical_expander.open:
+        with clinical_expander:
+            if not paths.clinical_db.exists():
+                st.caption("Startup preparation did not provide clinical detail.")
+                render_detail_install_notice(
+                    "Clinical detail is required for diagnosis, site, sex-at-birth, and "
+                    "vital-status filters. Participant search remains available from the core inventory."
                 )
-                pathology_values[column] = selected
-                working = apply_token_filter(working, column, selected)
-
-    clinical_values: dict[str, list[str]] = {}
-    age_at_imaging_range = (0, 120)
-    include_inferred_clinical = True
-    with st.expander("Advanced clinical filters", expanded=False):
-        if not paths.clinical_db.exists():
-            st.caption("Startup preparation did not provide clinical detail.")
-            render_detail_install_notice(
-                "Clinical detail is required for diagnosis, site, sex-at-birth, and "
-                "vital-status filters. Participant search remains available from the core inventory."
-            )
-        else:
-            st.caption(
-                "Clinical filters use the installed detail artifact; raw and alternate "
-                "values remain available in participant provenance."
-            )
-            clinical_settings, age_control = st.columns([1, 2])
-            include_inferred_clinical = clinical_settings.toggle(
-                "Include dataset-inferred diagnosis and site",
-                value=True,
-                key="draft_include_inferred_clinical",
-                help=(
-                    "When disabled, diagnosis and site choices use patient-level or "
-                    "patient-inherited evidence only. Other patients remain visible unless "
-                    "a diagnosis or site value is selected."
-                ),
-            )
-            age_at_imaging_range = age_control.slider(
-                "Earliest recorded age at imaging",
-                min_value=0,
-                max_value=120,
-                value=(0, 120),
-                step=1,
-                format="%d years",
-                key="draft_age_at_imaging",
-                help=(
-                    "Uses the earliest accepted age-at-imaging value. Changing the full "
-                    "range excludes patients whose imaging age is unavailable."
-                ),
-            )
-            if age_at_imaging_range != (0, 120):
-                ages = pd.to_numeric(
-                    working["age_at_imaging_years"], errors="coerce"
+            else:
+                st.caption(
+                    "Clinical filters use the installed detail artifact; raw and alternate "
+                    "values remain available in participant provenance."
                 )
-                working = working[
-                    ages.between(*age_at_imaging_range, inclusive="both")
-                ]
-
-            c1, c2, c3, c4 = st.columns(4)
-            clinical_filters = [
-                (c1, "Primary diagnosis", "primary_diagnosis", "draft_diagnosis"),
-                (c2, "Primary site", "primary_site", "draft_site"),
-                (c3, "Sex at birth", "sex_at_birth", "draft_sex"),
-                (c4, "Vital status", "vital_status", "draft_vital"),
-            ]
-            for container, label, column, key in clinical_filters:
-                option_frame = working
-                inference_column = f"{column}_is_inferred"
-                if (
-                    not include_inferred_clinical
-                    and inference_column in working
-                ):
-                    option_frame = working[
-                        ~working[inference_column].fillna(False).astype(bool)
+                with st.form("advanced_clinical_filter_form", border=False):
+                    clinical_settings, age_control = st.columns([1, 2])
+                    include_inferred_control = clinical_settings.toggle(
+                        "Include dataset-inferred diagnosis and site",
+                        key="draft_include_inferred_clinical",
+                        **lazy_widget_default(
+                            "draft_include_inferred_clinical", "value"
+                        ),
+                        help=(
+                            "When disabled, diagnosis and site choices use patient-level or "
+                            "patient-inherited evidence only. Other patients remain visible unless "
+                            "a diagnosis or site value is selected."
+                        ),
+                    )
+                    age_control.slider(
+                        "Earliest recorded age at imaging",
+                        min_value=0,
+                        max_value=120,
+                        step=1,
+                        format="%d years",
+                        key="draft_age_at_imaging",
+                        **lazy_widget_default(
+                            "draft_age_at_imaging", "value"
+                        ),
+                        help=(
+                            "Uses the earliest accepted age-at-imaging value. Changing the full "
+                            "range excludes patients whose imaging age is unavailable."
+                        ),
+                    )
+                    c1, c2, c3, c4 = st.columns(4)
+                    clinical_filters = [
+                        (c1, "Primary diagnosis", "primary_diagnosis", "draft_diagnosis"),
+                        (c2, "Primary site", "primary_site", "draft_site"),
+                        (c3, "Sex at birth", "sex_at_birth", "draft_sex"),
+                        (c4, "Vital status", "vital_status", "draft_vital"),
                     ]
-                selected = container.multiselect(
-                    label, option_values(option_frame, column), key=key
-                )
-                clinical_values[column] = selected
-                if selected:
-                    selected_mask = working[column].isin(selected)
-                    if (
-                        not include_inferred_clinical
-                        and inference_column in working
-                    ):
-                        selected_mask &= ~working[inference_column].fillna(
-                            False
-                        ).astype(bool)
-                    working = working[selected_mask]
+                    for container, label, column, key in clinical_filters:
+                        option_frame = working
+                        inference_column = f"{column}_is_inferred"
+                        if (
+                            not include_inferred_control
+                            and inference_column in working
+                        ):
+                            option_frame = working[
+                                ~working[inference_column].fillna(False).astype(bool)
+                            ]
+                        container.multiselect(
+                            label,
+                            option_values(option_frame, column),
+                            key=key,
+                            **lazy_widget_default(key, "default"),
+                        )
+                    clinical_submitted = st.form_submit_button(
+                        "Apply clinical filters", type="primary"
+                    )
+                if clinical_submitted:
+                    apply_filter_drafts(CLINICAL_FILTER_KEYS)
+
+    include_inferred_clinical = bool(
+        applied_filter("draft_include_inferred_clinical")
+    )
+    age_at_imaging_range = tuple(applied_filter("draft_age_at_imaging"))
+    clinical_values = {
+        "primary_diagnosis": list(applied_filter("draft_diagnosis")),
+        "primary_site": list(applied_filter("draft_site")),
+        "sex_at_birth": list(applied_filter("draft_sex")),
+        "vital_status": list(applied_filter("draft_vital")),
+    }
+    if age_at_imaging_range != (0, 120):
+        ages = pd.to_numeric(working["age_at_imaging_years"], errors="coerce")
+        working = working[
+            ages.between(*age_at_imaging_range, inclusive="both")
+        ]
+    for column, selected in clinical_values.items():
+        if not selected:
+            continue
+        selected_mask = working[column].isin(selected)
+        inference_column = f"{column}_is_inferred"
+        if not include_inferred_clinical and inference_column in working:
+            selected_mask &= ~working[inference_column].fillna(False).astype(bool)
+        working = working[selected_mask]
 
     reset_col, count_col = st.columns([.18, .82], vertical_alignment="center")
     reset_col.button("Clear filters", on_click=clear_filters, width="stretch")

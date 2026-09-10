@@ -28,6 +28,7 @@ from cohort_builder_data import (
     filter_patient_groups_by_dataset_type,
     filter_patient_groups_by_asset_facets,
     filter_imaging_rows,
+    geometry_match_mask,
     idc_viewer_url,
     load_clinical_subjects,
     load_idc_series,
@@ -52,6 +53,39 @@ import pandas as pd
 
 
 class CohortBuilderDataTests(unittest.TestCase):
+    def test_inactive_asset_filters_reuse_the_immutable_patient_frame(self):
+        patients = pd.DataFrame(
+            [{"patient_group_key": "p1", "subject_id": "P1"}]
+        )
+
+        result = filter_patient_groups_by_asset_facets(
+            patients,
+            pd.DataFrame(),
+            pd.DataFrame(),
+        )
+
+        self.assertIs(result, patients)
+
+    def test_vectorized_geometry_mask_matches_statuses_and_counts(self):
+        frame = pd.DataFrame(
+            [
+                {"geometry_status": "checked_regular"},
+                {"geometry_statuses": "checked_not_regular; not_checked"},
+                {"geometry_regular_count": 2},
+                {"geometry_not_regular_count": 1},
+                {"geometry_status": "not_checked"},
+            ]
+        )
+
+        self.assertEqual(
+            geometry_match_mask(frame, "Regular").tolist(),
+            [True, False, True, False, False],
+        )
+        self.assertEqual(
+            geometry_match_mask(frame, "Irregular").tolist(),
+            [False, True, False, True, False],
+        )
+
     def test_shared_v2_install_dir_is_used_by_default(self):
         with tempfile.TemporaryDirectory() as directory:
             install_dir = Path(directory) / "v2"
