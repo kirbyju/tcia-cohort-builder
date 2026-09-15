@@ -22,7 +22,7 @@ V2_RELEASE_TAG = os.environ.get(
 )
 BUNDLE_MANIFEST_ASSET = "tcia_metadata_v2_bundle_manifest.json"
 INSTALL_STATE_ASSET = "tcia_metadata_v2_install.json"
-BUNDLE_SCHEMA_VERSION = 2
+SUPPORTED_BUNDLE_SCHEMA_VERSIONS = {2, 3}
 SUPPORTED_RELEASE_CONTRACTS = {"full", "streamlined"}
 SUPPORTED_COMPONENTS = {
     "snapshot": {"schema_versions": {7}, "profile": "research_core"},
@@ -183,10 +183,14 @@ def _validate_bundle_manifest(payload: dict[str, Any]) -> None:
         raise RuntimeError(
             f"Expected V2 release {V2_RELEASE_TAG}, got {payload.get('release_tag')}"
         )
-    if payload.get("schema_version") != BUNDLE_SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if schema_version not in SUPPORTED_BUNDLE_SCHEMA_VERSIONS:
+        supported = ", ".join(
+            str(value) for value in sorted(SUPPORTED_BUNDLE_SCHEMA_VERSIONS)
+        )
         raise RuntimeError(
             "Unsupported V2 bundle schema: "
-            f"expected {BUNDLE_SCHEMA_VERSION}, got {payload.get('schema_version')}"
+            f"expected one of {supported}, got {schema_version}"
         )
     release_contract = str(payload.get("release_contract") or "")
     if release_contract not in SUPPORTED_RELEASE_CONTRACTS:

@@ -167,6 +167,30 @@ class V2ArtifactCacheTests(unittest.TestCase):
                 "clinical_metadata_detail_artifact",
             )
 
+    def test_bundle_schema_three_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            bundle = stable_bundle()
+            bundle["schema_version"] = 3
+            write_install(cache, bundle)
+
+            installation = load_bundle_installation(cache)
+
+            self.assertEqual(installation.manifest["schema_version"], 3)
+
+    def test_unknown_bundle_schema_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            bundle = stable_bundle()
+            bundle["schema_version"] = 4
+            write_install(cache, bundle)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Unsupported V2 bundle schema: expected one of 2, 3, got 4",
+            ):
+                load_bundle_installation(cache)
+
     def test_preview_release_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = Path(directory)
