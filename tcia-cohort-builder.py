@@ -14,9 +14,11 @@ import pandas as pd
 import streamlit as st
 
 from cohort_builder_data import (
+    ASPERA_MANIFEST_HEADER,
     DATASET_TYPE_FILTERS,
     GEOMETRY_FILTER_OPTIONS,
     add_idc_imaging_facets,
+    add_public_aspera_package_urls,
     POLICY_URL,
     DataPaths,
     add_idc_viewer_urls,
@@ -33,6 +35,7 @@ from cohort_builder_data import (
     filter_imaging_rows,
     load_dataset_catalog,
     load_dataset_aspera_packages,
+    load_dataset_clinical_downloads,
     load_dataset_coverage_states,
     load_patient_clinical_facts,
     load_patient_clinical_longitudinal,
@@ -443,12 +446,24 @@ def render_brand_and_cart() -> None:
 
     if not items:
         st.sidebar.info("Select a patient, then add viewable series or routed files.")
-        st.sidebar.caption("The cart keeps public DICOM, PathDB, and controlled DRS routes separate.")
+        st.sidebar.caption(
+            "The cart keeps public DICOM, Aspera, PathDB, and controlled DRS routes separate."
+        )
         return
 
     cart_frame = pd.DataFrame(items)
     counts = cart_frame["manifest_header"].value_counts()
-    st.sidebar.caption(" · ".join(f"{name}: {count}" for name, count in counts.items()))
+    route_labels = {
+        "SeriesInstanceUID": "DICOM series",
+        ASPERA_MANIFEST_HEADER: "Aspera paths",
+        "imageUrl": "PathDB files",
+        "drs_uri": "controlled DRS files",
+    }
+    st.sidebar.caption(
+        " · ".join(
+            f"{route_labels.get(name, name)}: {count}" for name, count in counts.items()
+        )
+    )
     with st.sidebar.expander("Review cart", expanded=False):
         st.dataframe(
             cart_frame[["label", "source", "access_level"]],
@@ -638,7 +653,8 @@ def _render_filtered_cohort_export_contents(
             prepared = None
         st.write(
             "Prepare all matching patients—not only the visible table rows—as a "
-            "patient-level clinical CSV plus route-specific TCIA Data Retriever manifests."
+            "patient-level clinical CSV plus route-specific Data Retriever and "
+            "Aspera manifests."
         )
         matching_only = imaging_contents == "Only imaging matching filters"
         if matching_only:
@@ -702,6 +718,7 @@ def _render_filtered_cohort_export_contents(
             counts = prepared["counts"]
             route_labels = {
                 "SeriesInstanceUID": "DICOM series",
+                ASPERA_MANIFEST_HEADER: "Aspera file paths",
                 "imageUrl": "PathDB files",
                 "drs_uri": "controlled DRS files",
                 "unrouted_imaging": "unrouted imaging rows",
@@ -726,7 +743,15 @@ def _render_filtered_cohort_export_contents(
                     "Controlled DRS entries require authorization and TCIA Data "
                     "Retriever API-key configuration."
                 )
-            if not any(key in counts for key in ("SeriesInstanceUID", "imageUrl", "drs_uri")):
+            if not any(
+                key in counts
+                for key in (
+                    "SeriesInstanceUID",
+                    ASPERA_MANIFEST_HEADER,
+                    "imageUrl",
+                    "drs_uri",
+                )
+            ):
                 st.info(
                     "No supported imaging routes match the current filters. The "
                     "package still contains the patient CSV and any unrouted imaging inventory."
@@ -1066,6 +1091,12 @@ def render_imaging(
             )
             if not frame.empty:
                 frame = frame.copy()
+                frame = add_public_aspera_package_urls(
+                    frame,
+                    load_dataset_aspera_packages(
+                        paths.snapshot_db, str(member.short_title)
+                    ),
+                )
                 frame["dataset_context"] = str(member.short_title)
                 public_frames.append(frame)
         public_detail = (
@@ -1109,7 +1140,7 @@ def render_imaging(
             columns = populated_columns(
                 public_detail,
                 (
-                    "dataset_context", "file_name", "asset_name", "file_format", "media_kind", "modality",
+                    "dataset_context", "file_name", "package_path", "asset_name", "file_format", "media_kind", "modality",
                     "geometry_status", "source_url",
                     "body_part_examined", "study_datetime", "sequence_class",
                     "sequence_tags", "sequences_present", "acquisition_dimensionality",
@@ -1141,6 +1172,53 @@ def render_imaging(
                 "The tab count is the participant-linked represented file count from "
                 "the Participant Inventory. Each row is one logical asset; location "
                 "count shows delivery/viewer copies without multiplying the asset count."
+            )
+            aspera_routed = public_detail[
+                public_detail["aspera_package_url"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .ne("")
+                & public_detail["package_path"].fillna("").astype(str).str.strip().ne("")
+            ]
+            add_label = (
+                "Add matching Aspera files"
+                if matching_only
+                else "Add all Aspera files"
+            )
+            if st.button(
+                add_label,
+                disabled=aspera_routed.empty,
+                key=(
+                    f"draft_add_aspera_{patient_key}_"
+                    f"{'all' if include_all_related else short_title}"
+                ),
+            ):
+                finish_cart_add(
+                    add_cart_items(
+                        [
+                            cart_item(
+                                "aspera",
+                                row.get("package_path"),
+                                package_url=str(row.get("aspera_package_url", "")),
+                                short_title=str(
+                                    row.get("dataset_context", short_title)
+                                ),
+                                subject_id=subject_id,
+                                label=(
+                                    f"Aspera · {row.get('file_name') or row.get('package_path')}"
+                                ),
+                                source="TCIA Aspera",
+                                access_level="open",
+                            )
+                            for _, row in aspera_routed.iterrows()
+                        ]
+                    )
+                )
+            st.caption(
+                "Aspera manifests include the public package URL and each selected "
+                "package-relative path for use with ascli. The full-package links above "
+                "remain available for the web workflow."
             )
             location_expander = st.expander(
                 "Access and viewer locations",
@@ -1384,6 +1462,44 @@ def render_patient_detail(
             else:
                 st.info("No participant-linked clinical data are represented in the inventory.")
         else:
+            clinical_downloads = load_dataset_clinical_downloads(
+                paths.clinical_db,
+                str(patient["short_title"]),
+            )
+            if not clinical_downloads.empty:
+                st.markdown(
+                    "<div class='section-label'>Clinical source files</div>",
+                    unsafe_allow_html=True,
+                )
+                for source in clinical_downloads.to_dict("records"):
+                    source_id = str(
+                        source.get("source_id") or source.get("download_id") or "source"
+                    )
+                    source_title = str(
+                        source.get("download_title") or "Clinical source file"
+                    ).strip()
+                    st.link_button(
+                        f"Open {source_title}",
+                        str(source["download_url"]),
+                        key=f"clinical_source_{patient['patient_key']}_{source_id}",
+                        icon=":material/description:",
+                        width="content",
+                    )
+                    source_details = " · ".join(
+                        value
+                        for value in (
+                            str(source.get("file_types") or "").strip(),
+                            str(source.get("date_updated") or "").strip(),
+                            (
+                                f"{safe_int(source.get('subjects_loaded')):,} subjects"
+                                if safe_int(source.get("subjects_loaded"))
+                                else ""
+                            ),
+                        )
+                        if value
+                    )
+                    if source_details:
+                        st.caption(source_details)
             facts = load_patient_clinical_facts(
                 paths.clinical_db,
                 str(patient["short_title"]),
@@ -1391,7 +1507,16 @@ def render_patient_detail(
                 subject_ids=subject_ids,
             )
             if not facts.empty:
-                st.dataframe(facts, hide_index=True, width="stretch")
+                st.dataframe(
+                    facts,
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "source_url": st.column_config.LinkColumn(
+                            "Source file", display_text="Open source"
+                        )
+                    },
+                )
                 st.caption(
                     "Submitted values remain beside normalized, harmonized, inferred, and "
                     "resolved representations; standardized values do not overwrite originals."

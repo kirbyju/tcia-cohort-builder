@@ -28,6 +28,7 @@ import pyarrow.parquet as pq
 LOGGER = logging.getLogger(__name__)
 POLICY_URL = "https://www.cancerimagingarchive.net/nih-controlled-data-access-policy/"
 OPEN_ACCESS_LEVELS = {"open", "open_noncommercial"}
+ASPERA_MANIFEST_HEADER = "AsperaPackagePath"
 DATASET_TYPE_FILTERS = ("All", "Collection", "Analysis Result")
 GEOMETRY_FILTER_OPTIONS = ("Any", "Regular", "Irregular")
 REGULAR_GEOMETRY_STATUSES = {"checked_regular", "checked_grid_geometry"}
@@ -2345,6 +2346,64 @@ def load_patient_clinical_facts(
     )
 
 
+def load_dataset_clinical_downloads(path: Path, short_title: str) -> pd.DataFrame:
+    """Return public source files ingested into the clinical detail artifact."""
+    columns = [
+        "source_id",
+        "download_id",
+        "download_title",
+        "download_url",
+        "date_updated",
+        "file_types",
+        "download_types",
+        "data_types",
+        "access_level",
+        "ingest_status",
+        "rows_loaded",
+        "subjects_loaded",
+    ]
+    source = preferred_object(path, "clinical_downloads")
+    if not source:
+        return pd.DataFrame(columns=columns)
+    available = read_sql(path, f"SELECT * FROM {source} LIMIT 0").columns
+    required = {"short_title", "download_url"}
+    if not required.issubset(available):
+        return pd.DataFrame(columns=columns)
+    selected = [column for column in columns if column in available]
+    controlled_filter = (
+        "AND COALESCE(controlled_access, 0) = 0"
+        if "controlled_access" in available
+        else ""
+    )
+    downloads = read_sql(
+        path,
+        f"""
+        SELECT {', '.join(selected)}
+        FROM {source}
+        WHERE lower(short_title) = lower(?)
+          AND COALESCE(TRIM(download_url), '') <> ''
+          {controlled_filter}
+        ORDER BY COALESCE(download_title, ''), COALESCE(download_id, '')
+        """,
+        (short_title,),
+    )
+    if downloads.empty:
+        return pd.DataFrame(columns=columns)
+    if "access_level" in downloads:
+        downloads = downloads[
+            downloads["access_level"]
+            .fillna("")
+            .astype(str)
+            .str.casefold()
+            .isin(OPEN_ACCESS_LEVELS)
+        ]
+    downloads = downloads.drop_duplicates(subset=["download_url"], keep="first")
+    for column in columns:
+        if column not in downloads:
+            downloads[column] = ""
+    return downloads[columns].reset_index(drop=True)
+
+
 def load_patient_clinical_longitudinal(
     path: Path,
     short_title: str,
@@ -2631,9 +2690,9 @@ def load_patient_nifti_packages(
 
 
 def is_public_aspera_package_url(value: object) -> bool:
-    """Accept only the two public TCIA Faspex URL shapes exposed by WordPress."""
+    """Accept the public TCIA Faspex URL shapes exposed by WordPress."""
     parsed = urlparse(str(value).strip())
-    allowed_paths = {"", "/aspera/faspex/public/package"}
+    allowed_paths = {"", "/aspera/faspex", "/aspera/faspex/public/package"}
     return (
         parsed.scheme == "https"
         and (parsed.hostname or "").casefold()
@@ -2748,6 +2807,7 @@ def load_patient_public_non_dicom(
     geometry_status_sql = (
         "a.geometry_status" if "geometry_status" in asset_columns else "''"
     )
+    download_id_sql = "a.download_id" if "download_id" in asset_columns else "''"
     has_geometry_assessments = (
         "public_non_dicom_geometry_assessments" in sqlite_objects(path)
     )
@@ -2768,7 +2828,9 @@ def load_patient_public_non_dicom(
     return read_sql(
         path,
         f"""
-        SELECT a.asset_id, a.dataset_type, a.short_title, a.asset_name,
+        SELECT a.asset_id, a.dataset_type, a.short_title,
+               {download_id_sql} AS download_id,
+               a.asset_name,
                a.file_name, a.package_path, a.file_format, a.media_kind,
                a.imaging_domain, a.modality, a.object_role,
                {geometry_status_sql} AS geometry_status,
@@ -2792,6 +2854,43 @@ def load_patient_public_non_dicom(
         """,
         (short_title, subject_id),
     )
+
+
+def add_public_aspera_package_urls(
+    assets: pd.DataFrame, packages: pd.DataFrame
+) -> pd.DataFrame:
+    """Bind file-grain assets to exact, open TCIA Faspex package URLs.
+
+    The V2 artifact carries the package-relative path and download ID. The
+    snapshot remains authoritative for the current public package URL; a
+    validated artifact source URL is used only when no matching snapshot row
+    is available.
+    """
+    result = assets.copy()
+    if result.empty:
+        result["aspera_package_url"] = pd.Series(dtype="object")
+        return result
+
+    package_by_id: dict[str, str] = {}
+    if not packages.empty and {"download_id", "download_url"}.issubset(packages):
+        package_by_id = {
+            str(row.download_id).strip(): str(row.download_url).strip()
+            for row in packages[["download_id", "download_url"]].itertuples(index=False)
+            if str(row.download_id).strip()
+            and is_public_aspera_package_url(row.download_url)
+        }
+
+    def package_url(row: pd.Series) -> str:
+        download_id = str(row.get("download_id") or "").strip()
+        if download_id in package_by_id:
+            return package_by_id[download_id]
+        source_url = str(
+            row.get("source_url") or row.get("package_url") or ""
+        ).strip()
+        return source_url if is_public_aspera_package_url(source_url) else ""
+
+    result["aspera_package_url"] = result.apply(package_url, axis=1)
+    return result
 
 
 def load_public_non_dicom_image_metadata(
@@ -2976,13 +3075,26 @@ def cart_item(
     label: str,
     source: str,
     access_level: str,
+    package_url: str = "",
 ) -> dict[str, str] | None:
-    route_headers = {"dicom": "SeriesInstanceUID", "pathdb": "imageUrl", "drs": "drs_uri"}
+    route_headers = {
+        "dicom": "SeriesInstanceUID",
+        "pathdb": "imageUrl",
+        "drs": "drs_uri",
+        "aspera": ASPERA_MANIFEST_HEADER,
+    }
     header = route_headers.get(route)
     clean_value = str(value or "").strip()
     if not header or not clean_value:
         return None
-    item_id = f"{header}|{clean_value}"
+    clean_package_url = str(package_url or "").strip()
+    if route == "aspera" and not is_public_aspera_package_url(clean_package_url):
+        return None
+    item_id = (
+        f"{header}|{clean_package_url}|{clean_value}"
+        if route == "aspera"
+        else f"{header}|{clean_value}"
+    )
     return {
         "item_id": item_id,
         "route": route,
@@ -2993,6 +3105,7 @@ def cart_item(
         "label": label,
         "source": source,
         "access_level": access_level,
+        "package_url": clean_package_url,
     }
 
 
@@ -3014,6 +3127,20 @@ def _manifest_csv(header: str, values: Iterable[str]) -> bytes:
     return text.getvalue().encode("utf-8")
 
 
+def _aspera_manifest_csv(items: Iterable[Mapping[str, str]]) -> bytes:
+    text = io.StringIO(newline="")
+    writer = csv.writer(text, lineterminator="\n")
+    writer.writerow(["packageUrl", "packagePath"])
+    rows = {
+        (str(item.get("package_url", "")).strip(), str(item.get("value", "")).strip())
+        for item in items
+        if is_public_aspera_package_url(item.get("package_url", ""))
+        and str(item.get("value", "")).strip()
+    }
+    writer.writerows(sorted(rows, key=lambda row: (row[0].casefold(), row[1].casefold())))
+    return text.getvalue().encode("utf-8")
+
+
 def build_manifest_download(
     items: Iterable[Mapping[str, str]],
 ) -> tuple[bytes, str, str, dict[str, int]]:
@@ -3021,16 +3148,36 @@ def build_manifest_download(
     clean = deduplicate_cart(items)
     if not clean:
         raise ValueError("The shopping cart is empty.")
+    aspera_items = [
+        item for item in clean if item["manifest_header"] == ASPERA_MANIFEST_HEADER
+    ]
+    route_items = [
+        item for item in clean if item["manifest_header"] != ASPERA_MANIFEST_HEADER
+    ]
     groups: dict[str, list[str]] = {}
-    for item in clean:
+    for item in route_items:
         groups.setdefault(item["manifest_header"], []).append(item["value"])
     counts = {header: len(set(values)) for header, values in groups.items()}
+    if aspera_items:
+        counts[ASPERA_MANIFEST_HEADER] = len(
+            {
+                (item["package_url"], item["value"])
+                for item in aspera_items
+            }
+        )
     names = {
         "SeriesInstanceUID": "tcia_dicom_series.csv",
         "imageUrl": "tcia_pathdb_files.csv",
         "drs_uri": "tcia_controlled_drs.csv",
     }
-    if len(groups) == 1:
+    if aspera_items and not groups:
+        return (
+            _aspera_manifest_csv(aspera_items),
+            "tcia_aspera_files.csv",
+            "text/csv",
+            counts,
+        )
+    if len(groups) == 1 and not aspera_items:
         header, values = next(iter(groups.items()))
         return _manifest_csv(header, values), names[header], "text/csv", counts
 
@@ -3038,15 +3185,24 @@ def build_manifest_download(
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for header, values in groups.items():
             archive.writestr(names[header], _manifest_csv(header, values))
+        if aspera_items:
+            archive.writestr("tcia_aspera_files.csv", _aspera_manifest_csv(aspera_items))
         archive.writestr(
             "README.txt",
-            "Extract the archive and open one CSV at a time with TCIA Data "
-            "Retriever. Each CSV intentionally contains exactly one supported "
-            "route column.\n",
+            "Extract the archive. Open each SeriesInstanceUID, imageUrl, or "
+            "drs_uri CSV separately with TCIA Data Retriever. "
+            "tcia_aspera_files.csv is not a Data Retriever manifest; it pairs "
+            "each public Faspex package URL with a package-relative path for "
+            "selective retrieval with ascli. For each row, run: ascli faspex5 "
+            "packages receive --url=\"<packageUrl>\" \"<packagePath>\".\n",
         )
     return (
         buffer.getvalue(),
-        "tcia_data_retriever_manifests.zip",
+        (
+            "tcia_retrieval_manifests.zip"
+            if aspera_items
+            else "tcia_data_retriever_manifests.zip"
+        ),
         "application/zip",
         counts,
     )
@@ -3155,6 +3311,7 @@ def _read_public_participant_export_rows(
             path,
             f"""
             SELECT ap.short_title, TRIM(ap.subject_id) AS subject_id,
+                   {asset_expr('download_id')} AS download_id,
                    {asset_expr('file_name')} AS file_name,
                    {asset_expr('package_path')} AS package_path,
                    ap.asset_id,
@@ -3189,6 +3346,7 @@ def _read_public_participant_export_rows(
         ("agent_public_non_dicom_asset_participants",),
         (
             "short_title, TRIM(subject_id) AS subject_id, "
+            f"{view_expr('download_id')} AS download_id, "
             f"{view_expr('file_name')} AS file_name, "
             f"{view_expr('package_path')} AS package_path, asset_id, "
             f"{view_expr('file_format')} AS file_format, "
@@ -3217,9 +3375,9 @@ def collect_filtered_imaging_routes(
     body_parts: Sequence[str] = (),
     geometry: str = "Any",
     direct_collection_titles: Sequence[str] = (),
-) -> tuple[dict[str, list[str]], pd.DataFrame]:
+) -> tuple[dict[str, list[object]], pd.DataFrame]:
     """Collect route values and auditable unrouted rows for a filtered cohort."""
-    routes: dict[str, list[str]] = {}
+    routes: dict[str, list[object]] = {}
     unrouted: list[pd.DataFrame] = []
     if patients.empty:
         return routes, pd.DataFrame()
@@ -3451,6 +3609,30 @@ def collect_filtered_imaging_routes(
             ):
                 public_non_dicom = public_non_dicom[selected_mask].copy()
 
+        package_frames = [
+            load_dataset_aspera_packages(paths.snapshot_db, short_title)
+            for short_title in short_titles
+        ]
+        public_non_dicom = add_public_aspera_package_urls(
+            public_non_dicom,
+            pd.concat(package_frames, ignore_index=True, sort=False)
+            if package_frames
+            else pd.DataFrame(),
+        )
+        aspera_routed = (
+            public_non_dicom["aspera_package_url"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .ne("")
+            & public_non_dicom["package_path"].fillna("").astype(str).str.strip().ne("")
+        )
+        routes[ASPERA_MANIFEST_HEADER] = list(
+            public_non_dicom.loc[
+                aspera_routed, ["aspera_package_url", "package_path"]
+            ].itertuples(index=False, name=None)
+        )
+
         locations = load_public_non_dicom_locations(
             paths.public_non_dicom_db,
             public_non_dicom.get("asset_id", pd.Series(dtype=str)).astype(str).tolist(),
@@ -3470,6 +3652,7 @@ def collect_filtered_imaging_routes(
         retain_unrouted(
             public_non_dicom[
                 ~public_non_dicom["asset_id"].astype(str).isin(directly_routed)
+                & ~aspera_routed
             ],
             "Public non-DICOM",
             "file_name",
@@ -3499,11 +3682,26 @@ def collect_filtered_imaging_routes(
             "Available through a dataset-level Aspera package; not an IDC series route.",
         )
 
-    clean_routes = {
-        header: sorted(set(value for value in values if str(value).strip()))
-        for header, values in routes.items()
-        if values
-    }
+    clean_routes: dict[str, list[object]] = {}
+    for header, values in routes.items():
+        if header == ASPERA_MANIFEST_HEADER:
+            clean_values = sorted(
+                {
+                    (str(value[0]).strip(), str(value[1]).strip())
+                    for value in values
+                    if isinstance(value, tuple)
+                    and len(value) == 2
+                    and is_public_aspera_package_url(value[0])
+                    and str(value[1]).strip()
+                },
+                key=lambda value: (value[0].casefold(), value[1].casefold()),
+            )
+        else:
+            clean_values = sorted(
+                set(str(value).strip() for value in values if str(value).strip())
+            )
+        if clean_values:
+            clean_routes[header] = clean_values
     unrouted_frame = (
         pd.concat(unrouted, ignore_index=True, sort=False).drop_duplicates()
         if unrouted
@@ -3514,7 +3712,7 @@ def collect_filtered_imaging_routes(
 
 def build_filtered_cohort_download(
     patients: pd.DataFrame,
-    routes: Mapping[str, Sequence[str]],
+    routes: Mapping[str, Sequence[object]],
     unrouted: pd.DataFrame | None = None,
     selection: Mapping[str, object] | None = None,
 ) -> tuple[bytes, str, str, dict[str, int]]:
@@ -3534,6 +3732,26 @@ def build_filtered_cohort_download(
         )
         archive.writestr("tcia_filtered_patients.csv", patient_csv)
         for header, values in routes.items():
+            if header == ASPERA_MANIFEST_HEADER:
+                aspera_items = [
+                    {
+                        "package_url": str(value[0]).strip(),
+                        "value": str(value[1]).strip(),
+                    }
+                    for value in values
+                    if isinstance(value, tuple) and len(value) == 2
+                ]
+                if aspera_items:
+                    archive.writestr(
+                        "tcia_aspera_files.csv", _aspera_manifest_csv(aspera_items)
+                    )
+                    counts[ASPERA_MANIFEST_HEADER] = len(
+                        {
+                            (item["package_url"], item["value"])
+                            for item in aspera_items
+                        }
+                    )
+                continue
             clean_values = sorted(
                 set(str(value).strip() for value in values if str(value).strip())
             )
@@ -3560,7 +3778,11 @@ def build_filtered_cohort_download(
                 "CSV at a time with TCIA Data Retriever. SeriesInstanceUID routes public "
                 "DICOM, imageUrl routes direct public files, and drs_uri routes authorized "
                 "controlled files. Controlled routes still require approval and API-key "
-                "configuration. The unrouted inventory, when present, is metadata for imaging "
+                "configuration. tcia_aspera_files.csv is not a Data Retriever manifest; "
+                "each row pairs an open TCIA Faspex package URL with a package-relative "
+                "path. For each row, run: ascli faspex5 packages receive "
+                "--url=\"<packageUrl>\" \"<packagePath>\". The unrouted "
+                "inventory, when present, is metadata for imaging "
                 "that has no supported Data Retriever route; it is not a download manifest. "
                 "Its package_url column identifies the published dataset-level package when "
                 "one is represented. cohort_selection.json records the filters and imaging "

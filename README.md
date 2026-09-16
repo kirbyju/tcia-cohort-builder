@@ -17,13 +17,15 @@ and supporting files, and preparing retrieval manifests.
 - on-demand IDC, public non-DICOM, controlled-access, and clinical detail;
 - opt-in clinical cohort filters, longitudinal imaging context, and schema-7/8
   public image metadata;
-- public WordPress Aspera package links shown separately from participant assets
-  and TCIA Data Retriever routes;
+- public WordPress Aspera package links retained for the full-package web
+  workflow, with participant-linked package paths available in separate Aspera
+  manifests for selective `ascli` retrieval;
 - explicit missing-crosswalk and participant-link coverage states;
 - logical asset counts that do not multiply alternate delivery locations;
 - viewer routes for publicly viewable imaging; and
-- filtered cohort downloads containing patient-level clinical data plus
-  route-specific TCIA Data Retriever manifests.
+- filtered cohort downloads containing patient-level clinical data,
+  route-specific TCIA Data Retriever manifests, and file-scoped Aspera
+  manifests when exact public package URLs and package paths are available.
 
 ## Requirements
 
@@ -97,9 +99,12 @@ Data category, data type, file format, and image geometry qualify participants
 through same-asset facet matching. The `Imaging & download contents` control
 then chooses whether Imaging & Files and cohort manifests contain all linked
 imaging for those participants or only series/files matching the imaging
-facets. Dataset-package-only rows remain in the unrouted inventory and include
-the published package URL; they are not represented as individually routable
-TCIA Data Retriever files.
+facets. Participant-linked public package rows with an exact open Faspex URL
+and package-relative path are exported to `tcia_aspera_files.csv`. Each row
+pairs `packageUrl` with `packagePath` for selective
+`ascli faspex5 packages receive` use. This CSV is intentionally not presented
+as a TCIA Data Retriever manifest. Rows without both values remain in the
+unrouted inventory, which retains the published package URL when represented.
 
 Set `TCIA_V2_INSTALL_DIR` to share one official bundle installation with the
 MCP and REST services. `TCIA_METADATA_V2_CACHE` is the Streamlit-specific

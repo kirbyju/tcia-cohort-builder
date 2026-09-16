@@ -9,8 +9,10 @@ from pathlib import Path
 from unittest import mock
 
 from cohort_builder_data import (
+    ASPERA_MANIFEST_HEADER,
     DataPaths,
     add_idc_imaging_facets,
+    add_public_aspera_package_urls,
     aggregate_idc,
     build_patient_index,
     build_filtered_cohort_download,
@@ -34,6 +36,7 @@ from cohort_builder_data import (
     load_idc_series,
     load_idc_patient_search_summary,
     load_dataset_aspera_packages,
+    load_dataset_clinical_downloads,
     load_patient_idc,
     load_patient_idc_scope,
     load_patient_clinical_longitudinal,
@@ -251,6 +254,117 @@ class CohortBuilderDataTests(unittest.TestCase):
 
             self.assertEqual(packages["download_id"].tolist(), ["1"])
 
+    def test_dataset_aspera_packages_accept_current_faspex_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "snapshot.sqlite"
+            with sqlite3.connect(path) as connection:
+                connection.execute(
+                    "CREATE TABLE agent_current_downloads (short_title TEXT, hidden INTEGER, "
+                    "download_id TEXT, download_title TEXT, download_url TEXT, "
+                    "access_level TEXT, controlled_access INTEGER)"
+                )
+                connection.execute(
+                    "INSERT INTO agent_current_downloads VALUES (?,?,?,?,?,?,?)",
+                    (
+                        "Yale-Brain-Mets-Longitudinal",
+                        0,
+                        "51716",
+                        "Radiology Images",
+                        "https://faspex.cancerimagingarchive.net/aspera/faspex"
+                        "?context=public-package",
+                        "open",
+                        0,
+                    ),
+                )
+
+            packages = load_dataset_aspera_packages(
+                path, "Yale-Brain-Mets-Longitudinal"
+            )
+
+            self.assertEqual(packages["download_id"].tolist(), ["51716"])
+
+    def test_dataset_clinical_downloads_preserve_public_source_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "clinical.sqlite"
+            with sqlite3.connect(path) as connection:
+                connection.execute(
+                    "CREATE TABLE clinical_downloads (source_id TEXT, short_title TEXT, "
+                    "download_id TEXT, download_title TEXT, download_url TEXT, "
+                    "date_updated TEXT, file_types TEXT, access_level TEXT, "
+                    "controlled_access INTEGER, ingest_status TEXT, rows_loaded INTEGER, "
+                    "subjects_loaded INTEGER)"
+                )
+                connection.executemany(
+                    "INSERT INTO clinical_downloads VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [
+                        (
+                            "source-public",
+                            "Yale-Brain-Mets-Longitudinal",
+                            "51718",
+                            "Clinical data and Scanner details",
+                            "https://www.cancerimagingarchive.net/wp-content/uploads/yale.xlsx",
+                            "2025-06-20",
+                            '["XLSX"]',
+                            "open",
+                            0,
+                            "reused",
+                            57580,
+                            1430,
+                        ),
+                        (
+                            "source-controlled",
+                            "Yale-Brain-Mets-Longitudinal",
+                            "private",
+                            "Private clinical data",
+                            "https://example.org/private.xlsx",
+                            "2025-06-20",
+                            '["XLSX"]',
+                            "controlled",
+                            1,
+                            "skipped",
+                            0,
+                            0,
+                        ),
+                    ],
+                )
+
+            downloads = load_dataset_clinical_downloads(
+                path, "Yale-Brain-Mets-Longitudinal"
+            )
+
+            self.assertEqual(downloads["source_id"].tolist(), ["source-public"])
+            self.assertEqual(int(downloads.iloc[0]["rows_loaded"]), 57580)
+            self.assertEqual(int(downloads.iloc[0]["subjects_loaded"]), 1430)
+
+    def test_aspera_assets_bind_to_exact_public_snapshot_package(self):
+        assets = pd.DataFrame(
+            [
+                {
+                    "download_id": "42",
+                    "package_path": "P1/scan.nii.gz",
+                    "source_url": "https://example.org/stale",
+                }
+            ]
+        )
+        packages = pd.DataFrame(
+            [
+                {
+                    "download_id": "42",
+                    "download_url": (
+                        "https://faspex.cancerimagingarchive.net/"
+                        "?context=public-package"
+                    ),
+                }
+            ]
+        )
+
+        result = add_public_aspera_package_urls(assets, packages)
+
+        self.assertEqual(
+            result.iloc[0]["aspera_package_url"],
+            "https://faspex.cancerimagingarchive.net/?context=public-package",
+        )
+
     def test_filtered_mha_export_does_not_require_controlled_drs_column(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -295,6 +409,89 @@ class CohortBuilderDataTests(unittest.TestCase):
                 unrouted.iloc[0]["package_url"],
                 "https://faspex.example/package",
             )
+
+    def test_filtered_mha_export_includes_aspera_package_path_route(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            public_db = root / "public.sqlite"
+            snapshot_db = root / "snapshot.sqlite"
+            with sqlite3.connect(public_db) as connection:
+                connection.execute(
+                    "CREATE TABLE agent_public_non_dicom_asset_participants ("
+                    "short_title TEXT, subject_id TEXT, download_id TEXT, "
+                    "file_name TEXT, package_path TEXT, asset_id TEXT, "
+                    "file_format TEXT, media_kind TEXT, imaging_domain TEXT, "
+                    "modality TEXT, source_url TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO agent_public_non_dicom_asset_participants "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        "TEST",
+                        "P1",
+                        "42",
+                        "scan.nii.gz",
+                        "P1/scan.nii.gz",
+                        "asset1",
+                        "NIFTI",
+                        "image",
+                        "radiology",
+                        "MR",
+                        "https://example.org/stale",
+                    ),
+                )
+            with sqlite3.connect(snapshot_db) as connection:
+                connection.execute(
+                    "CREATE TABLE agent_current_downloads ("
+                    "short_title TEXT, hidden INTEGER, download_id TEXT, "
+                    "download_title TEXT, download_url TEXT, access_level TEXT, "
+                    "controlled_access INTEGER)"
+                )
+                connection.execute(
+                    "INSERT INTO agent_current_downloads VALUES (?,?,?,?,?,?,?)",
+                    (
+                        "TEST",
+                        0,
+                        "42",
+                        "NIfTI",
+                        "https://faspex.cancerimagingarchive.net/"
+                        "?context=public-package",
+                        "open",
+                        0,
+                    ),
+                )
+            missing = root / "missing.sqlite"
+            paths = DataPaths(
+                snapshot_db,
+                missing,
+                missing,
+                missing,
+                missing,
+                missing,
+                public_non_dicom_db=public_db,
+            )
+            patients = pd.DataFrame(
+                [{"short_title": "TEST", "subject_id": "P1"}]
+            )
+
+            routes, unrouted = collect_filtered_imaging_routes(
+                paths,
+                pd.DataFrame(),
+                patients,
+                imaging_sources=["NIfTI files"],
+            )
+
+            self.assertEqual(
+                routes[ASPERA_MANIFEST_HEADER],
+                [
+                    (
+                        "https://faspex.cancerimagingarchive.net/"
+                        "?context=public-package",
+                        "P1/scan.nii.gz",
+                    )
+                ],
+            )
+            self.assertTrue(unrouted.empty)
 
     def test_asset_facets_require_same_row_geometry_and_data_type(self):
         patients = pd.DataFrame(
@@ -1465,6 +1662,37 @@ class CohortBuilderDataTests(unittest.TestCase):
         self.assertEqual(mime, "text/csv")
         self.assertEqual(counts, {"SeriesInstanceUID": 1})
 
+    def test_aspera_manifest_pairs_public_package_url_and_relative_path(self):
+        item = cart_item(
+            "aspera",
+            "P1/scan.nii.gz",
+            package_url=(
+                "https://faspex.cancerimagingarchive.net/?context=public-package"
+            ),
+            short_title="TEST",
+            subject_id="P1",
+            label="Scan",
+            source="TCIA Aspera",
+            access_level="open",
+        )
+
+        payload, filename, mime, counts = build_manifest_download([item])
+        rows = list(csv.reader(io.StringIO(payload.decode("utf-8"))))
+
+        self.assertEqual(
+            rows,
+            [
+                ["packageUrl", "packagePath"],
+                [
+                    "https://faspex.cancerimagingarchive.net/?context=public-package",
+                    "P1/scan.nii.gz",
+                ],
+            ],
+        )
+        self.assertEqual(filename, "tcia_aspera_files.csv")
+        self.assertEqual(mime, "text/csv")
+        self.assertEqual(counts, {ASPERA_MANIFEST_HEADER: 1})
+
     def test_mixed_routes_are_separate_files(self):
         items = [
             cart_item(
@@ -1530,6 +1758,12 @@ class CohortBuilderDataTests(unittest.TestCase):
         routes = {
             "SeriesInstanceUID": ["1.2.3", "1.2.3", "1.2.4"],
             "imageUrl": ["https://example.org/slide.svs"],
+            ASPERA_MANIFEST_HEADER: [
+                (
+                    "https://faspex.cancerimagingarchive.net/?context=public-package",
+                    "P2/scan.nii.gz",
+                )
+            ],
         }
         unrouted = pd.DataFrame(
             [
@@ -1559,6 +1793,7 @@ class CohortBuilderDataTests(unittest.TestCase):
         self.assertEqual(counts["patients"], 2)
         self.assertEqual(counts["SeriesInstanceUID"], 2)
         self.assertEqual(counts["imageUrl"], 1)
+        self.assertEqual(counts[ASPERA_MANIFEST_HEADER], 1)
         self.assertEqual(counts["unrouted_imaging"], 1)
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
             self.assertEqual(
@@ -1568,6 +1803,7 @@ class CohortBuilderDataTests(unittest.TestCase):
                     "tcia_filtered_patients.csv",
                     "tcia_dicom_series.csv",
                     "tcia_pathdb_files.csv",
+                    "tcia_aspera_files.csv",
                     "tcia_unrouted_imaging_inventory.csv",
                     "cohort_selection.json",
                 },
@@ -1585,6 +1821,17 @@ class CohortBuilderDataTests(unittest.TestCase):
             ).decode("utf-8")
             self.assertIn("package_url", inventory_csv.splitlines()[0])
             self.assertIn("https://faspex.example/package", inventory_csv)
+            aspera_csv = archive.read("tcia_aspera_files.csv").decode("utf-8")
+            self.assertEqual(
+                aspera_csv.splitlines(),
+                [
+                    "packageUrl,packagePath",
+                    (
+                        "https://faspex.cancerimagingarchive.net/"
+                        "?context=public-package,P2/scan.nii.gz"
+                    ),
+                ],
+            )
             selection = json.loads(archive.read("cohort_selection.json"))
             self.assertEqual(selection["image_geometry"], "Regular")
 
