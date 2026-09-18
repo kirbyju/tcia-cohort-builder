@@ -349,6 +349,65 @@ report_bundle_recovery() {
   fi
 }
 
+repository_restore_is_safe() {
+  local label=$1
+  local root=$2
+  local previous_commit=$3
+  local updated_commit=$4
+  local current_commit status
+
+  current_commit="$(git -C "$root" rev-parse HEAD)" || return 1
+  if [[ "$current_commit" == "$previous_commit" ]]; then
+    return 0
+  fi
+  if [[ "$current_commit" != "$updated_commit" ]]; then
+    warn "Refusing to roll back $label from unexpected commit $current_commit"
+    return 1
+  fi
+  status="$(git -C "$root" status --porcelain --untracked-files=normal)" || return 1
+  if [[ -n "$status" ]]; then
+    warn "Refusing to discard changes created in $label during the deployment"
+    printf '%s\n' "$status" >&2
+    return 1
+  fi
+}
+
+restore_repository() {
+  local label=$1
+  local root=$2
+  local previous_commit=$3
+  local current_commit
+
+  current_commit="$(git -C "$root" rev-parse HEAD)" || return 1
+  if [[ "$current_commit" == "$previous_commit" ]]; then
+    return 0
+  fi
+  git -C "$root" reset --hard "$previous_commit" >/dev/null || return 1
+  log "Restored $label source to $previous_commit"
+}
+
+rollback_source_state() {
+  if ! repository_restore_is_safe "TCIA query skill" "$QUERY_ROOT" "$QUERY_BEFORE" "$QUERY_AFTER"; then
+    return 1
+  fi
+  if ! repository_restore_is_safe "Participant Explorer" "$COHORT_ROOT" "$COHORT_BEFORE" "$COHORT_AFTER"; then
+    return 1
+  fi
+  if ! restore_repository "TCIA query skill" "$QUERY_ROOT" "$QUERY_BEFORE"; then
+    return 1
+  fi
+  if ! restore_repository "Participant Explorer" "$COHORT_ROOT" "$COHORT_BEFORE"; then
+    return 1
+  fi
+
+  # Requirements are pinned application state too. Reapply the previous
+  # revisions before restarting their services.
+  "$MCP_PYTHON" -m pip install --disable-pip-version-check \
+    -r "$QUERY_ROOT/mcp_server/requirements.txt" || return 1
+  "$COHORT_PYTHON" -m pip install --disable-pip-version-check \
+    -r "$COHORT_ROOT/requirements.txt" || return 1
+}
+
 rollback_activation() {
   local temporary_link
 
@@ -360,6 +419,10 @@ rollback_activation() {
     return 1
   fi
   warn "Restoring the previous validated bundle after failed deployment verification"
+  if ! rollback_source_state; then
+    warn "Automatic rollback could not restore the previous source and dependencies"
+    return 1
+  fi
   temporary_link="${CURRENT_LINK}.rollback.$$"
   if [[ -e "$temporary_link" || -L "$temporary_link" ]]; then
     warn "Automatic rollback blocked by existing temporary link: $temporary_link"
@@ -528,6 +591,25 @@ print(fingerprint)
 PY
 }
 
+find_reusable_bundle() {
+  local releases_root=$1
+  local expected_fingerprint=$2
+  local candidate
+
+  [[ -d "$releases_root" ]] || return 1
+  while IFS= read -r candidate; do
+    if validate_installed_bundle "$candidate" >/dev/null 2>&1 &&
+       [[ "$(bundle_fingerprint "$candidate/tcia_metadata_v2_bundle_manifest.json")" == "$expected_fingerprint" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(
+    find "$releases_root" -mindepth 1 -maxdepth 1 -type d \
+      -name '[0-9]*T[0-9]*Z-query-[0-9a-f]*' -print | sort -r
+  )
+  return 1
+}
+
 validate_cohort_bundle_contract() {
   local install_dir=$1
   TCIA_METADATA_V2_RELEASE_TAG="$BUNDLE_TAG" \
@@ -556,6 +638,54 @@ print(
     "Participant Explorer bundle compatibility: "
     f"fingerprint={installation.release_fingerprint} schemas={schemas}"
 )
+PY
+}
+
+validate_query_service_contract() {
+  local install_dir=$1
+  "$MCP_PYTHON" - "$QUERY_ROOT" "$install_dir" <<'PY'
+import pathlib
+import sys
+
+from fastapi.testclient import TestClient
+
+query_root = pathlib.Path(sys.argv[1]).resolve()
+install_dir = pathlib.Path(sys.argv[2]).resolve()
+sys.path.insert(0, str(query_root))
+
+from mcp_server.tcia_query_mcp.rest import create_app
+from mcp_server.tcia_query_mcp.service import TciaQueryService
+
+service = TciaQueryService(
+    snapshot_db=install_dir / "tcia_snapshot.sqlite",
+    controlled_db=install_dir / "controlled_access_metadata.sqlite",
+    clinical_db=install_dir / "clinical_metadata.sqlite",
+    participant_db=install_dir / "participant_inventory.sqlite",
+    public_non_dicom_db=install_dir / "public_non_dicom_metadata.sqlite",
+    bundle_manifest=install_dir / "tcia_metadata_v2_bundle_manifest.json",
+    skill_root=query_root,
+)
+client = TestClient(create_app(service), raise_server_exceptions=False)
+
+bundle_response = client.get("/v2/bundle")
+if bundle_response.status_code != 200:
+    raise SystemExit(
+        f"Candidate REST /v2/bundle failed before activation: "
+        f"HTTP {bundle_response.status_code} {bundle_response.text[:500]}"
+    )
+ready_response = client.get("/v2/ready")
+if ready_response.status_code != 200:
+    raise SystemExit(
+        f"Candidate REST /v2/ready failed before activation: "
+        f"HTTP {ready_response.status_code} {ready_response.text[:500]}"
+    )
+
+bundle = bundle_response.json()
+ready = ready_response.json()
+expected_fingerprint = bundle["v2_bundle"]["release_fingerprint"]
+if ready.get("release_fingerprint") != expected_fingerprint:
+    raise SystemExit("Candidate REST bundle and readiness fingerprints differ")
+print(f"Candidate query service contract: fingerprint={expected_fingerprint}")
 PY
 }
 
@@ -814,12 +944,11 @@ curl -fsSL --max-time 60 "$BUNDLE_MANIFEST_URL" -o "$REMOTE_MANIFEST"
 REMOTE_BUNDLE_FINGERPRINT="$(bundle_fingerprint "$REMOTE_MANIFEST")"
 log "Stable V2 bundle fingerprint: $REMOTE_BUNDLE_FINGERPRINT"
 
-if [[ -n "$PREVIOUS_BUNDLE_TARGET" && -d "$PREVIOUS_BUNDLE_TARGET" ]] &&
-   validate_installed_bundle "$PREVIOUS_BUNDLE_TARGET" >/dev/null 2>&1 &&
-   [[ "$(bundle_fingerprint "$PREVIOUS_BUNDLE_TARGET/tcia_metadata_v2_bundle_manifest.json")" == "$REMOTE_BUNDLE_FINGERPRINT" ]]; then
-  NEW_INSTALL_DIR="$PREVIOUS_BUNDLE_TARGET"
+REUSABLE_BUNDLE="$(find_reusable_bundle "$RELEASES_ROOT" "$REMOTE_BUNDLE_FINGERPRINT" || true)"
+if [[ -n "$REUSABLE_BUNDLE" ]]; then
+  NEW_INSTALL_DIR="$REUSABLE_BUNDLE"
   BUNDLE_REUSED=1
-  log "Reusing the current validated V2 bundle because its fingerprint is unchanged"
+  log "Reusing a retained validated V2 bundle with the stable fingerprint: $NEW_INSTALL_DIR"
 else
   NEW_INSTALL_DIR="$RELEASES_ROOT/$TIMESTAMP-query-${QUERY_AFTER:0:12}"
   [[ ! -e "$NEW_INSTALL_DIR" ]] || die "Versioned install directory already exists: $NEW_INSTALL_DIR"
@@ -841,6 +970,8 @@ log "Validating the official bundle manifest and install receipt"
 validate_installed_bundle "$NEW_INSTALL_DIR"
 log "Validating Participant Explorer compatibility with the installed bundle"
 validate_cohort_bundle_contract "$NEW_INSTALL_DIR"
+log "Validating MCP/REST compatibility with the installed bundle before activation"
+validate_query_service_contract "$NEW_INSTALL_DIR"
 
 switch_current_bundle "$NEW_INSTALL_DIR" "$CURRENT_LINK"
 ACTIVATION_STARTED=1
