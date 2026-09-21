@@ -1,31 +1,44 @@
 #!/usr/bin/env bash
 
-# Update the TCIA query services and Participant Explorer on the alpha server.
+# Update a co-hosted TCIA query service and Participant Explorer deployment.
 #
 # Run without arguments for a deployment. Run with --preflight to verify the
 # repositories, Python environments, service units, and shared environment file
 # without changing source code, dependencies, bundle data, or services. Run with
-# --cleanup-only to remove old verified versioned bundles without using network.
+# --cleanup-only to remove old verified versioned bundles without using network,
+# or with --code-only to update code and dependencies while reusing the current
+# validated metadata bundle.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-QUERY_ROOT="${TCIA_QUERY_SKILL_ROOT:-/home/exouser/tcia-query-skill}"
-COHORT_ROOT="${TCIA_COHORT_BUILDER_ROOT:-/home/exouser/tcia-cohort-builder}"
-ENV_FILE="${TCIA_ENV_FILE:-/home/exouser/.config/tcia/tcia.env}"
-MCP_PYTHON="${TCIA_MCP_PYTHON:-/home/exouser/.venvs/tcia-query-mcp/bin/python}"
-COHORT_PYTHON="${TCIA_COHORT_PYTHON:-/home/exouser/.venvs/tcia-cohort-builder/bin/python}"
+ENV_FILE="${TCIA_ENV_FILE:-$HOME/.config/tcia/tcia.env}"
+if [[ ! -f "$ENV_FILE" ]]; then
+  printf 'Required shared environment file does not exist: %s\n' "$ENV_FILE" >&2
+  exit 1
+fi
+set -a
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+set +a
 
-COHORT_HEALTH_URL="${TCIA_COHORT_HEALTH_URL:-https://tcia-p-explorer.duckdns.org/_stcore/health}"
-REST_HEALTH_URL="${TCIA_REST_HEALTH_URL:-https://tcia.duckdns.org/v2/health}"
-REST_READY_URL="${TCIA_REST_READY_URL:-https://tcia.duckdns.org/v2/ready}"
-REST_BUNDLE_URL="${TCIA_REST_BUNDLE_URL:-https://tcia.duckdns.org/v2/bundle}"
-REST_LOCAL_HEALTH_URL="${TCIA_REST_LOCAL_HEALTH_URL:-http://127.0.0.1:8766/v2/health}"
+QUERY_ROOT="${TCIA_QUERY_SKILL_ROOT:-$HOME/tcia-query-skill}"
+COHORT_ROOT="${TCIA_COHORT_BUILDER_ROOT:-$HOME/tcia-cohort-builder}"
+MCP_PYTHON="${TCIA_MCP_PYTHON:-$HOME/.venvs/tcia-query-mcp/bin/python}"
+COHORT_PYTHON="${TCIA_COHORT_PYTHON:-$HOME/.venvs/tcia-cohort-builder/bin/python}"
+
+# Public endpoint values are deployment-specific and must be supplied through
+# the process environment or ENV_FILE. Local loopback defaults are portable.
+COHORT_HEALTH_URL="${TCIA_COHORT_HEALTH_URL:-}"
+REST_HEALTH_URL="${TCIA_REST_HEALTH_URL:-}"
+REST_READY_URL="${TCIA_REST_READY_URL:-}"
+REST_BUNDLE_URL="${TCIA_REST_BUNDLE_URL:-}"
+REST_LOCAL_HEALTH_URL="${TCIA_REST_LOCAL_HEALTH_URL:-http://127.0.0.1:8766/v2/live}"
 MCP_HEALTH_URL="${TCIA_MCP_HEALTH_URL:-http://127.0.0.1:8765/mcp}"
-MCP_HEALTH_HOST="${TCIA_MCP_HEALTH_HOST:-tcia.duckdns.org}"
-MCP_PUBLIC_URL="${TCIA_MCP_PUBLIC_URL:-https://tcia.duckdns.org/mcp}"
-MCP_PUBLIC_HOST="${TCIA_MCP_PUBLIC_HOST:-tcia.duckdns.org}"
+MCP_HEALTH_HOST="${TCIA_MCP_HEALTH_HOST:-}"
+MCP_PUBLIC_URL="${TCIA_MCP_PUBLIC_URL:-}"
+MCP_PUBLIC_HOST="${TCIA_MCP_PUBLIC_HOST:-}"
 
 BUNDLE_TAG="${TCIA_METADATA_V2_RELEASE_TAG:-tcia-metadata-v2-latest}"
 BUNDLE_MANIFEST_URL="${TCIA_V2_BUNDLE_MANIFEST_URL:-https://github.com/kirbyju/tcia-query-skill/releases/download/$BUNDLE_TAG/tcia_metadata_v2_bundle_manifest.json}"
@@ -35,10 +48,13 @@ HEALTH_ATTEMPTS="${TCIA_HEALTH_ATTEMPTS:-30}"
 HEALTH_DELAY_SECONDS="${TCIA_HEALTH_DELAY_SECONDS:-2}"
 PROGRESS_HEARTBEAT_SECONDS="${TCIA_PROGRESS_HEARTBEAT_SECONDS:-30}"
 
+MCP_SERVICE="${TCIA_MCP_SERVICE:-tcia-query-mcp}"
+REST_SERVICE="${TCIA_REST_SERVICE:-tcia-query-rest}"
+COHORT_SERVICE="${TCIA_COHORT_SERVICE:-tcia-cohort-builder}"
 SERVICES=(
-  tcia-query-mcp
-  tcia-query-rest
-  tcia-cohort-builder
+  "$MCP_SERVICE"
+  "$REST_SERVICE"
+  "$COHORT_SERVICE"
 )
 
 MODE="deploy"
@@ -46,8 +62,10 @@ if [[ ${1:-} == "--preflight" ]]; then
   MODE="preflight"
 elif [[ ${1:-} == "--cleanup-only" ]]; then
   MODE="cleanup"
+elif [[ ${1:-} == "--code-only" ]]; then
+  MODE="code-only"
 elif [[ -n ${1:-} ]]; then
-  echo "Usage: $0 [--preflight|--cleanup-only]" >&2
+  echo "Usage: $0 [--preflight|--cleanup-only|--code-only]" >&2
   exit 2
 fi
 
@@ -189,6 +207,18 @@ validate_env_value() {
     die "$name contains a character that cannot be written safely to $ENV_FILE"
 }
 
+require_config_value() {
+  local name=$1
+  local value=$2
+  [[ -n "$value" ]] || die "$name must be set in the environment or $ENV_FILE"
+}
+
+set_mcp_protocol_version() {
+  MCP_PROTOCOL_VERSION="$("$MCP_PYTHON" -c 'from mcp.types import LATEST_PROTOCOL_VERSION; print(LATEST_PROTOCOL_VERSION)')"
+  [[ "$MCP_PROTOCOL_VERSION" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] ||
+    die "Could not determine a valid MCP protocol version from $MCP_PYTHON"
+}
+
 repo_preflight() {
   local label=$1
   local root=$2
@@ -301,14 +331,20 @@ check_mcp_endpoint() {
   local url=$1
   local host_header=$2
   local payload
+  local -a curl_args
   printf -v payload '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"%s","capabilities":{},"clientInfo":{"name":"tcia-update-check","version":"1.0"}}}' "$MCP_PROTOCOL_VERSION"
-  curl -fsS --max-time 15 \
-    -X POST "$url" \
-    -H "Host: $host_header" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json, text/event-stream' \
-    --data "$payload" \
+  curl_args=(
+    -fsS --max-time 15
+    -X POST "$url"
+    -H 'Content-Type: application/json'
+    -H 'Accept: application/json, text/event-stream'
+    --data "$payload"
     -o /dev/null
+  )
+  if [[ -n "$host_header" ]]; then
+    curl_args+=( -H "Host: $host_header" )
+  fi
+  curl "${curl_args[@]}"
 }
 
 check_mcp_health() {
@@ -403,7 +439,7 @@ rollback_source_state() {
   # Requirements are pinned application state too. Reapply the previous
   # revisions before restarting their services.
   "$MCP_PYTHON" -m pip install --disable-pip-version-check \
-    -r "$QUERY_ROOT/mcp_server/requirements.txt" || return 1
+    --require-hashes --requirement "$QUERY_ROOT/requirements-server.lock" || return 1
   "$COHORT_PYTHON" -m pip install --disable-pip-version-check \
     -r "$COHORT_ROOT/requirements.txt" || return 1
 }
@@ -452,8 +488,8 @@ rollback_activation() {
     warn "Automatic rollback restarted services, but their units did not become active"
     return 1
   fi
-  if ! wait_for "rolled-back public REST /v2/health" check_rest_public_health; then
-    warn "Automatic rollback restored services, but public REST health did not recover"
+  if ! wait_for "rolled-back public REST liveness" check_rest_public_health; then
+    warn "Automatic rollback restored services, but public REST liveness did not recover"
     return 1
   fi
   if ! wait_for "rolled-back public REST /v2/ready" check_rest_public_ready; then
@@ -814,12 +850,6 @@ flock -n 9 || die "Another TCIA server update is already running"
 
 TEMP_ROOT="$(mktemp -d /tmp/tcia-update-server.XXXXXX)"
 
-log "Loading shared artifact configuration"
-set -a
-# shellcheck disable=SC1090
-source "$ENV_FILE"
-set +a
-
 # The stable V2 contract intentionally ignores and removes legacy standalone
 # NIfTI/pathology variables. The unified public non-DICOM database replaces both.
 unset TCIA_NIFTI_METADATA_DB TCIA_PATHOLOGY_METADATA_DB
@@ -867,31 +897,33 @@ fi
 
 require_executable "$MCP_PYTHON"
 require_executable "$COHORT_PYTHON"
-MCP_PROTOCOL_VERSION="$("$MCP_PYTHON" -c 'from mcp.types import LATEST_PROTOCOL_VERSION; print(LATEST_PROTOCOL_VERSION)')"
-[[ "$MCP_PROTOCOL_VERSION" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] ||
-  die "Could not determine a valid MCP protocol version from $MCP_PYTHON"
 validate_integer TCIA_HEALTH_ATTEMPTS "$HEALTH_ATTEMPTS"
 validate_integer TCIA_HEALTH_DELAY_SECONDS "$HEALTH_DELAY_SECONDS"
 validate_integer TCIA_V2_RETAIN_RELEASES "$RETAIN_RELEASES"
 validate_integer TCIA_PROGRESS_HEARTBEAT_SECONDS "$PROGRESS_HEARTBEAT_SECONDS"
 
 [[ "$RUN_TESTS" == "0" || "$RUN_TESTS" == "1" ]] || die "TCIA_RUN_TESTS must be 0 or 1"
-[[ "$REST_HEALTH_URL" != *"/v1/"* ]] || die "REST health must use /v2/health, not the compatibility /v1 endpoint"
+require_config_value TCIA_COHORT_HEALTH_URL "$COHORT_HEALTH_URL"
+require_config_value TCIA_REST_HEALTH_URL "$REST_HEALTH_URL"
+require_config_value TCIA_REST_READY_URL "$REST_READY_URL"
+require_config_value TCIA_REST_BUNDLE_URL "$REST_BUNDLE_URL"
+require_config_value TCIA_MCP_PUBLIC_URL "$MCP_PUBLIC_URL"
+[[ "$REST_HEALTH_URL" != *"/v1/"* ]] || die "REST health must use a V2 endpoint, not the compatibility V1 endpoint"
 [[ "$REST_READY_URL" != *"/v1/"* ]] || die "REST readiness must use /v2/ready, not the compatibility /v1 endpoint"
 [[ -O "$ENV_FILE" && -w "$ENV_FILE" ]] || die "The deployment user must own and be able to update $ENV_FILE"
 
 validate_env_value TCIA_QUERY_SKILL_ROOT "$QUERY_ROOT"
 validate_env_value TCIA_V2_RELEASE_TAG "$BUNDLE_TAG"
 
-require_file "$QUERY_ROOT/mcp_server/requirements.txt"
+require_file "$QUERY_ROOT/requirements-server.lock"
 require_file "$QUERY_ROOT/scripts/tcia_v2_bundle.py"
 require_file "$COHORT_ROOT/requirements.txt"
 require_file "$COHORT_ROOT/tcia-cohort-builder.py"
 
 detect_service_manager
-verify_service_configuration tcia-query-mcp
-verify_service_configuration tcia-query-rest
-verify_service_configuration tcia-cohort-builder
+verify_service_configuration "$MCP_SERVICE"
+verify_service_configuration "$REST_SERVICE"
+verify_service_configuration "$COHORT_SERVICE"
 
 repo_preflight "TCIA query skill" "$QUERY_ROOT"
 repo_preflight "Participant Explorer" "$COHORT_ROOT"
@@ -902,6 +934,7 @@ QUERY_AFTER="$QUERY_BEFORE"
 COHORT_AFTER="$COHORT_BEFORE"
 
 if [[ "$MODE" == "preflight" ]]; then
+  set_mcp_protocol_version
   log "Preflight passed; no source, dependency, bundle, environment, or service changes were made"
   exit 0
 fi
@@ -917,7 +950,11 @@ QUERY_AFTER="$(git -C "$QUERY_ROOT" rev-parse HEAD)"
 COHORT_AFTER="$(git -C "$COHORT_ROOT" rev-parse HEAD)"
 
 log "Installing MCP/REST dependencies"
-"$MCP_PYTHON" -m pip install --disable-pip-version-check -r "$QUERY_ROOT/mcp_server/requirements.txt"
+"$MCP_PYTHON" -m pip install --disable-pip-version-check \
+  --require-hashes --requirement "$QUERY_ROOT/requirements-server.lock"
+"$MCP_PYTHON" -m pip check
+set_mcp_protocol_version
+log "MCP protocol smoke-test revision: $MCP_PROTOCOL_VERSION"
 log "Installing Participant Explorer dependencies"
 "$COHORT_PYTHON" -m pip install --disable-pip-version-check -r "$COHORT_ROOT/requirements.txt"
 
@@ -938,20 +975,28 @@ fi
 
 mkdir -p -- "$RELEASES_ROOT" "$(dirname "$CURRENT_LINK")"
 
-REMOTE_MANIFEST="$TEMP_ROOT/tcia_metadata_v2_bundle_manifest.json"
-log "Fetching the stable V2 bundle manifest"
-curl -fsSL --max-time 60 "$BUNDLE_MANIFEST_URL" -o "$REMOTE_MANIFEST"
-REMOTE_BUNDLE_FINGERPRINT="$(bundle_fingerprint "$REMOTE_MANIFEST")"
-log "Stable V2 bundle fingerprint: $REMOTE_BUNDLE_FINGERPRINT"
-
-REUSABLE_BUNDLE="$(find_reusable_bundle "$RELEASES_ROOT" "$REMOTE_BUNDLE_FINGERPRINT" || true)"
-if [[ -n "$REUSABLE_BUNDLE" ]]; then
-  NEW_INSTALL_DIR="$REUSABLE_BUNDLE"
+if [[ "$MODE" == "code-only" ]]; then
+  [[ -n "$PREVIOUS_BUNDLE_TARGET" && -d "$PREVIOUS_BUNDLE_TARGET" ]] ||
+    die "Code-only deployment requires an existing active bundle target"
+  NEW_INSTALL_DIR="$PREVIOUS_BUNDLE_TARGET"
   BUNDLE_REUSED=1
-  log "Reusing a retained validated V2 bundle with the stable fingerprint: $NEW_INSTALL_DIR"
+  log "Code-only deployment: reusing the active validated V2 bundle without fetching or installing artifacts"
 else
-  NEW_INSTALL_DIR="$RELEASES_ROOT/$TIMESTAMP-query-${QUERY_AFTER:0:12}"
-  [[ ! -e "$NEW_INSTALL_DIR" ]] || die "Versioned install directory already exists: $NEW_INSTALL_DIR"
+  REMOTE_MANIFEST="$TEMP_ROOT/tcia_metadata_v2_bundle_manifest.json"
+  log "Fetching the stable V2 bundle manifest"
+  curl -fsSL --max-time 60 "$BUNDLE_MANIFEST_URL" -o "$REMOTE_MANIFEST"
+  REMOTE_BUNDLE_FINGERPRINT="$(bundle_fingerprint "$REMOTE_MANIFEST")"
+  log "Stable V2 bundle fingerprint: $REMOTE_BUNDLE_FINGERPRINT"
+
+  REUSABLE_BUNDLE="$(find_reusable_bundle "$RELEASES_ROOT" "$REMOTE_BUNDLE_FINGERPRINT" || true)"
+  if [[ -n "$REUSABLE_BUNDLE" ]]; then
+    NEW_INSTALL_DIR="$REUSABLE_BUNDLE"
+    BUNDLE_REUSED=1
+    log "Reusing a retained validated V2 bundle with the stable fingerprint: $NEW_INSTALL_DIR"
+  else
+    NEW_INSTALL_DIR="$RELEASES_ROOT/$TIMESTAMP-query-${QUERY_AFTER:0:12}"
+    [[ ! -e "$NEW_INSTALL_DIR" ]] || die "Versioned install directory already exists: $NEW_INSTALL_DIR"
+  fi
 fi
 
 if [[ "$BUNDLE_REUSED" == "1" ]]; then
@@ -973,9 +1018,13 @@ validate_cohort_bundle_contract "$NEW_INSTALL_DIR"
 log "Validating MCP/REST compatibility with the installed bundle before activation"
 validate_query_service_contract "$NEW_INSTALL_DIR"
 
-switch_current_bundle "$NEW_INSTALL_DIR" "$CURRENT_LINK"
-ACTIVATION_STARTED=1
-write_shared_environment "$CURRENT_LINK"
+if [[ "$MODE" == "code-only" ]]; then
+  ACTIVATION_STARTED=1
+else
+  switch_current_bundle "$NEW_INSTALL_DIR" "$CURRENT_LINK"
+  ACTIVATION_STARTED=1
+  write_shared_environment "$CURRENT_LINK"
+fi
 
 log "Restarting TCIA services"
 if ! restart_services; then
@@ -985,11 +1034,11 @@ fi
 if ! wait_for "systemd services" check_service_units; then
   verification_failed "systemd services"
 fi
-if ! wait_for "local REST /v2/health" check_rest_local_health; then
-  verification_failed "local REST /v2/health"
+if ! wait_for "local REST liveness" check_rest_local_health; then
+  verification_failed "local REST liveness"
 fi
-if ! wait_for "public REST /v2/health" check_rest_public_health; then
-  verification_failed "public REST /v2/health"
+if ! wait_for "public REST liveness" check_rest_public_health; then
+  verification_failed "public REST liveness"
 fi
 if ! wait_for "public REST /v2/ready" check_rest_public_ready; then
   verification_failed "public REST /v2/ready"
@@ -1011,9 +1060,11 @@ fi
 
 ACTIVATION_VALIDATED=1
 
-log "Pruning old versioned V2 bundle directories; retaining $RETAIN_RELEASES"
-RELEASE_PRUNE_ATTEMPTED=1
-prune_release_directories "$RELEASES_ROOT" "$CURRENT_LINK" "$RETAIN_RELEASES"
+if [[ "$MODE" != "code-only" ]]; then
+  log "Pruning old versioned V2 bundle directories; retaining $RETAIN_RELEASES"
+  RELEASE_PRUNE_ATTEMPTED=1
+  prune_release_directories "$RELEASES_ROOT" "$CURRENT_LINK" "$RETAIN_RELEASES"
+fi
 
 printf '\nDeployment complete.\n'
 printf 'Query commit:        %s\n' "$QUERY_AFTER"

@@ -129,19 +129,34 @@ The refresh writes to a temporary Parquet file and replaces the current index
 only after the complete IDC export succeeds. The daily GitHub Actions workflow
 uses the same command.
 
-## Alpha server update
+## Deployment updater
 
-After revised code and matching SQLite release assets have been published,
-fast-forward both server checkouts and install the stable `research_detail`
-profile into a new, versioned directory with the query-skill bundle installer.
-Point Streamlit, MCP, and REST at that same installation, restart all three
-services, and validate their V2 surfaces before removing the previous bundle.
+[`update_server.sh`](./update_server.sh) is a generic updater for a host running
+Participant Explorer together with the TCIA query MCP and REST services. It
+requires deployment paths and public endpoint URLs through environment
+variables or the shared environment file; it contains no production hostname,
+account, or home-directory defaults. Start from
+[`update_server.env.example`](./update_server.env.example).
+
+Normal deployment fast-forwards both clean `main` checkouts, installs
+hash-locked MCP/REST dependencies, runs tests, reuses an already validated V2
+bundle when its fingerprint matches the stable release, validates candidate
+service compatibility, switches atomically when necessary, restarts all three
+services, and verifies local/public health, readiness, MCP, and bundle state.
+
+For a code- or dependency-only release that does not change metadata artifacts,
+use `--code-only`. It requires and validates the existing active
+`research_detail` installation, performs no bundle-manifest fetch, artifact
+download, install, switch, or pruning, and still runs tests plus all
+post-restart service checks. Use `--preflight` for a read-only configuration
+check and `--cleanup-only` for bounded offline cleanup of managed old bundles.
 
 The exact service units, environment files, reverse-proxy configuration, and
 storage paths are deployment-specific. Follow the query-skill
 [deployment guide](https://github.com/kirbyju/tcia-query-skill/blob/main/mcp_server/DEPLOYMENT.md)
-for the supported variables, ports, installer, and smoke tests rather than an
-unchecked host-specific update script.
+for the supported variables, ports, installer, and smoke tests. Keep any
+rendered host-specific script or configuration outside Git; this repository
+ignores `update_server.server.sh` for that purpose.
 
 ## Tests
 

@@ -161,6 +161,9 @@ cython_debug/
 .DS_Store
 *.parquet.tmp
 
+# Server-specific deployment configuration/script rendered from the public updater.
+update_server.server.sh
+
 # Streamlit agent skills (environment-specific symlinks)
 .agents/skills/developing-with-streamlit
 .claude/skills/developing-with-streamlit
