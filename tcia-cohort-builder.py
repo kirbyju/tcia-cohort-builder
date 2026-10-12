@@ -30,6 +30,7 @@ from cohort_builder_data import (
     collect_filtered_imaging_routes,
     count_visible_dataset_contexts,
     deduplicate_cart,
+    filter_patient_groups_by_clinical_evidence,
     filter_patient_groups_by_dataset_type,
     filter_patient_groups_by_asset_facets,
     filter_imaging_rows,
@@ -64,7 +65,7 @@ from v2_artifacts import (
 )
 
 
-PATIENT_INDEX_SCHEMA_VERSION = 15
+PATIENT_INDEX_SCHEMA_VERSION = 16
 APP_DIR = Path(__file__).resolve().parent
 BRAND_SKILL_DIR = Path.home() / ".codex" / "skills" / "tcia-brand-guidelines"
 LOGO_PATH = BRAND_SKILL_DIR / "assets" / "tcia-logo-dark.svg"
@@ -2048,15 +2049,15 @@ def main() -> None:
                 with st.form("advanced_clinical_filter_form", border=False):
                     clinical_settings, age_control = st.columns([1, 2])
                     include_inferred_control = clinical_settings.toggle(
-                        "Include dataset-inferred diagnosis and site",
+                        "Include patients with only dataset-inferred diagnosis/site",
                         key="draft_include_inferred_clinical",
                         **lazy_widget_default(
                             "draft_include_inferred_clinical", "value"
                         ),
                         help=(
-                            "When disabled, diagnosis and site choices use patient-level or "
-                            "patient-inherited evidence only. Other patients remain visible unless "
-                            "a diagnosis or site value is selected."
+                            "When disabled, every matching patient must have at least one "
+                            "patient-level or patient-inherited clinical fact. Selected diagnosis "
+                            "and site values must also be supported by non-inferred evidence."
                         ),
                     )
                     age_control.slider(
@@ -2118,14 +2119,11 @@ def main() -> None:
         working = working[
             ages.between(*age_at_imaging_range, inclusive="both")
         ]
-    for column, selected in clinical_values.items():
-        if not selected:
-            continue
-        selected_mask = working[column].isin(selected)
-        inference_column = f"{column}_is_inferred"
-        if not include_inferred_clinical and inference_column in working:
-            selected_mask &= ~working[inference_column].fillna(False).astype(bool)
-        working = working[selected_mask]
+    working = filter_patient_groups_by_clinical_evidence(
+        working,
+        include_inferred=include_inferred_clinical,
+        selected_values=clinical_values,
+    )
 
     reset_col, count_col = st.columns([.18, .82], vertical_alignment="center")
     reset_col.button("Clear filters", on_click=clear_filters, width="stretch")
@@ -2179,7 +2177,9 @@ def main() -> None:
             ),
             (
                 "Clinical evidence",
-                "Patient-level only" if not include_inferred_clinical else "",
+                "Patient-level evidence required"
+                if not include_inferred_clinical
+                else "",
             ),
             ("Diagnosis", clinical_values.get("primary_diagnosis", [])),
             ("Site", clinical_values.get("primary_site", [])),

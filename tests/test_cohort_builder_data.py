@@ -27,10 +27,12 @@ from cohort_builder_data import (
     deduplicate_cart,
     enrich_participants_with_clinical_detail,
     exclude_nlst_clinical_only,
+    filter_patient_groups_by_clinical_evidence,
     filter_patient_groups_by_dataset_type,
     filter_patient_groups_by_asset_facets,
     filter_imaging_rows,
     geometry_match_mask,
+    has_patient_level_clinical_evidence,
     idc_viewer_url,
     load_clinical_subjects,
     load_idc_series,
@@ -56,6 +58,99 @@ import pandas as pd
 
 
 class CohortBuilderDataTests(unittest.TestCase):
+    def test_patient_level_clinical_evidence_uses_resolved_scope(self):
+        self.assertTrue(
+            has_patient_level_clinical_evidence(
+                json.dumps(
+                    {
+                        "sex_at_birth": {
+                            "evidence_scope": "patient",
+                            "is_inferred": False,
+                        },
+                        "primary_site": {
+                            "evidence_scope": "dataset",
+                            "is_inferred": True,
+                        },
+                    }
+                )
+            )
+        )
+        self.assertTrue(
+            has_patient_level_clinical_evidence(
+                {
+                    "primary_diagnosis": {
+                        "evidence_scope": "patient_inherited",
+                        "is_inferred": False,
+                    }
+                }
+            )
+        )
+        self.assertFalse(
+            has_patient_level_clinical_evidence(
+                json.dumps(
+                    {
+                        "primary_diagnosis": {
+                            "evidence_scope": "dataset",
+                            "is_inferred": True,
+                        }
+                    }
+                )
+            )
+        )
+
+    def test_disabling_inferred_clinical_requires_patient_level_evidence(self):
+        patients = pd.DataFrame(
+            [
+                {
+                    "subject_id": "DIRECT-CANCER",
+                    "has_patient_level_clinical_evidence": True,
+                    "primary_diagnosis": "Cancer",
+                    "primary_diagnosis_is_inferred": False,
+                },
+                {
+                    "subject_id": "DIRECT-OTHER",
+                    "has_patient_level_clinical_evidence": True,
+                    "primary_diagnosis": "Other",
+                    "primary_diagnosis_is_inferred": False,
+                },
+                {
+                    "subject_id": "DATASET-INFERRED",
+                    "has_patient_level_clinical_evidence": False,
+                    "primary_diagnosis": "Cancer",
+                    "primary_diagnosis_is_inferred": True,
+                },
+                {
+                    "subject_id": "NO-CLINICAL",
+                    "has_patient_level_clinical_evidence": False,
+                    "primary_diagnosis": None,
+                    "primary_diagnosis_is_inferred": False,
+                },
+            ]
+        )
+
+        unrestricted = filter_patient_groups_by_clinical_evidence(
+            patients,
+            include_inferred=True,
+            selected_values={"primary_diagnosis": []},
+        )
+        patient_level = filter_patient_groups_by_clinical_evidence(
+            patients,
+            include_inferred=False,
+            selected_values={"primary_diagnosis": []},
+        )
+        selected = filter_patient_groups_by_clinical_evidence(
+            patients,
+            include_inferred=False,
+            selected_values={"primary_diagnosis": ["Cancer"]},
+        )
+
+        self.assertEqual(len(unrestricted), 4)
+        self.assertEqual(
+            set(patient_level["subject_id"]),
+            {"DIRECT-CANCER", "DIRECT-OTHER"},
+        )
+        self.assertEqual(selected["subject_id"].tolist(), ["DIRECT-CANCER"])
+
     def test_inactive_asset_filters_reuse_the_immutable_patient_frame(self):
         patients = pd.DataFrame(
             [{"patient_group_key": "p1", "subject_id": "P1"}]
@@ -1541,11 +1636,14 @@ class CohortBuilderDataTests(unittest.TestCase):
                       short_title TEXT,
                       subject_id TEXT,
                       has_imaging INTEGER,
-                      age_at_diagnosis TEXT
+                      age_at_diagnosis TEXT,
+                      resolved_sources_json TEXT
                     );
                     INSERT INTO clinical_subjects VALUES
-                      ('TEST', 'P1', 1, '50'),
-                      ('TEST', 'P2', 0, '60');
+                      ('TEST', 'P1', 1, '50',
+                       '{"age_at_diagnosis":{"evidence_scope":"patient","is_inferred":false}}'),
+                      ('TEST', 'P2', 0, '60',
+                       '{"primary_site":{"evidence_scope":"dataset","is_inferred":true}}');
                     CREATE VIEW agent_clinical_subjects AS
                       SELECT * FROM clinical_subjects WHERE has_imaging = 1;
                     CREATE VIEW agent_clinical_all_subjects AS
@@ -1554,6 +1652,10 @@ class CohortBuilderDataTests(unittest.TestCase):
                 )
             result = load_clinical_subjects(path)
             self.assertEqual(set(result["subject_id"]), {"P1", "P2"})
+            evidence = result.set_index("subject_id")[
+                "has_patient_level_clinical_evidence"
+            ].to_dict()
+            self.assertEqual(evidence, {"P1": True, "P2": False})
 
     def test_clinical_aliases_collapse_and_preserve_source_ids(self):
         frame = pd.DataFrame(

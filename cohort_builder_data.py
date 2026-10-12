@@ -36,6 +36,7 @@ IRREGULAR_GEOMETRY_STATUSES = {
     "checked_not_regular",
     "checked_invalid_geometry",
 }
+PATIENT_LEVEL_CLINICAL_EVIDENCE_SCOPES = {"patient", "patient_inherited"}
 CLINICAL_CATEGORICAL_COLUMNS = (
     "sex_at_birth",
     "race",
@@ -387,6 +388,32 @@ def join_tokens(values: Iterable[object]) -> str:
     for value in values:
         tokens.update(split_tokens(value))
     return "; ".join(sorted(tokens, key=str.casefold))
+
+
+def has_patient_level_clinical_evidence(value: object) -> bool:
+    """Return whether resolved clinical provenance contains patient-level evidence."""
+    if isinstance(value, Mapping):
+        resolved_sources = value
+    else:
+        if value is None:
+            return False
+        try:
+            if pd.isna(value):
+                return False
+        except (TypeError, ValueError):
+            pass
+        try:
+            resolved_sources = json.loads(str(value))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return False
+    if not isinstance(resolved_sources, Mapping):
+        return False
+    return any(
+        isinstance(source, Mapping)
+        and normalize_category_key(source.get("evidence_scope"))
+        in PATIENT_LEVEL_CLINICAL_EVIDENCE_SCOPES
+        for source in resolved_sources.values()
+    )
 
 
 def participant_data_categories(row: Mapping[str, object]) -> str:
@@ -867,7 +894,7 @@ def collapse_clinical_subject_aliases(frame: pd.DataFrame) -> pd.DataFrame:
             }:
                 continue
             values = ordered[column]
-            if column == "has_imaging":
+            if column in {"has_imaging", "has_patient_level_clinical_evidence"}:
                 combined[column] = int(
                     pd.to_numeric(values, errors="coerce").fillna(0).max()
                 )
@@ -904,6 +931,9 @@ def load_clinical_subjects(path: Path) -> pd.DataFrame:
     frame["subject_id"] = frame["subject_id"].astype(str).str.strip()
     frame = frame[frame["subject_id"] != ""].copy()
     frame["has_clinical"] = True
+    frame["has_patient_level_clinical_evidence"] = frame.get(
+        "resolved_sources_json", pd.Series(pd.NA, index=frame.index)
+    ).map(has_patient_level_clinical_evidence)
     for column in (
         "age_at_diagnosis",
         "age_at_enrollment_years",
@@ -1670,7 +1700,7 @@ def enrich_participants_with_clinical_detail(
         "progression_free_survival_days", "primary_diagnosis_value_role",
         "primary_site_value_role", "primary_diagnosis_is_inferred",
         "primary_site_is_inferred", "source_kinds", "source_count", "conflict_count",
-        "clinical_subject_ids",
+        "clinical_subject_ids", "has_patient_level_clinical_evidence",
     ]
     if not path.exists():
         for column in clinical_columns:
@@ -1902,7 +1932,7 @@ def build_patient_index(paths: DataPaths) -> pd.DataFrame:
         patients[column] = pd.to_numeric(patients[column], errors="coerce").fillna(0).astype(int)
     for column in (
         "has_public_dicom", "has_public_non_dicom", "has_clinical",
-        "has_controlled_metadata", "has_annotations",
+        "has_patient_level_clinical_evidence", "has_controlled_metadata", "has_annotations",
     ):
         if column not in patients:
             patients[column] = False
@@ -2203,6 +2233,7 @@ def build_grouped_patient_index(
                 ).max(skipna=True)
         for column in (
             "has_clinical",
+            "has_patient_level_clinical_evidence",
             "has_idc_dicom_metadata",
             "has_public_dicom",
             "has_pathdb",
@@ -2270,6 +2301,33 @@ def build_grouped_patient_index(
         key=lambda series: series.astype(str).str.casefold(),
     ).reset_index(drop=True)
     return grouped, members
+
+
+def filter_patient_groups_by_clinical_evidence(
+    patients: pd.DataFrame,
+    *,
+    include_inferred: bool,
+    selected_values: Mapping[str, Sequence[str]],
+) -> pd.DataFrame:
+    """Apply patient-level evidence and selected clinical-value predicates."""
+    result = patients
+    if not include_inferred:
+        evidence = result.get(
+            "has_patient_level_clinical_evidence",
+            pd.Series(False, index=result.index),
+        ).fillna(False).astype(bool)
+        result = result[evidence]
+    for column, selected in selected_values.items():
+        if not selected:
+            continue
+        if column not in result:
+            return result.iloc[0:0].copy()
+        selected_mask = result[column].isin(selected)
+        inference_column = f"{column}_is_inferred"
+        if not include_inferred and inference_column in result:
+            selected_mask &= ~result[inference_column].fillna(False).astype(bool)
+        result = result[selected_mask]
+    return result
 
 
 def filter_patient_groups_by_dataset_type(
