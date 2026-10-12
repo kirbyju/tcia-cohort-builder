@@ -62,6 +62,12 @@ def write_install(cache: Path, bundle: dict, installed_assets=None):
 
 
 class V2ArtifactCacheTests(unittest.TestCase):
+    def test_snapshot_schema_eight_is_accepted(self):
+        _validate_component_contract(
+            "snapshot",
+            {"schema_version": 8, "profile": "research_core"},
+        )
+
     def test_clinical_schema_eighteen_is_accepted(self):
         _validate_component_contract(
             "clinical",

@@ -25,7 +25,7 @@ INSTALL_STATE_ASSET = "tcia_metadata_v2_install.json"
 SUPPORTED_BUNDLE_SCHEMA_VERSIONS = {2, 3}
 SUPPORTED_RELEASE_CONTRACTS = {"full", "streamlined"}
 SUPPORTED_COMPONENTS = {
-    "snapshot": {"schema_versions": {7}, "profile": "research_core"},
+    "snapshot": {"schema_versions": {7, 8}, "profile": "research_core"},
     "participant_inventory": {
         "schema_versions": {6, 7, 8},
         "profile": "research_core",
