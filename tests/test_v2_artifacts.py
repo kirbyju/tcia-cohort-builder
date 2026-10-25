@@ -287,6 +287,23 @@ class V2ArtifactCacheTests(unittest.TestCase):
                 8,
             )
 
+    def test_participant_schema_ten_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            bundle = stable_bundle(schema_version=10)
+            write_install(cache, bundle)
+            with sqlite3.connect(
+                cache / "participant_inventory.sqlite"
+            ) as connection:
+                connection.execute("CREATE TABLE example (value TEXT)")
+
+            self.assertEqual(
+                require_installed_component(
+                    cache, "participant_inventory"
+                ).schema_version,
+                10,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

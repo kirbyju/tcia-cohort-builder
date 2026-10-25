@@ -27,7 +27,7 @@ SUPPORTED_RELEASE_CONTRACTS = {"full", "streamlined"}
 SUPPORTED_COMPONENTS = {
     "snapshot": {"schema_versions": {7, 8}, "profile": "research_core"},
     "participant_inventory": {
-        "schema_versions": {6, 7, 8},
+        "schema_versions": {6, 7, 8, 10},
         "profile": "research_core",
     },
     "public_non_dicom": {"schema_versions": {7, 8}, "profile": "research_detail"},
