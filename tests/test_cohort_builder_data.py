@@ -809,7 +809,7 @@ class CohortBuilderDataTests(unittest.TestCase):
             path = Path(directory) / "public.sqlite"
             with sqlite3.connect(path) as connection:
                 connection.execute(
-                    "CREATE TABLE public_non_dicom_assets (asset_id TEXT, dataset_type TEXT, short_title TEXT, "
+                    "CREATE TABLE public_non_dicom_assets (asset_id TEXT PRIMARY KEY, dataset_type TEXT, short_title TEXT, "
                     "asset_name TEXT, file_name TEXT, package_path TEXT, file_format TEXT, media_kind TEXT, "
                     "imaging_domain TEXT, modality TEXT, object_role TEXT, represented_file_count INTEGER, size_bytes INTEGER, "
                     "participant_link_status TEXT, representation_provenance_class TEXT, source_system TEXT, "
@@ -834,7 +834,7 @@ class CohortBuilderDataTests(unittest.TestCase):
                     ],
                 )
                 connection.execute(
-                    "CREATE TABLE public_non_dicom_locations (location_id TEXT, asset_id TEXT, "
+                    "CREATE TABLE public_non_dicom_locations (location_id TEXT PRIMARY KEY, asset_id TEXT, "
                     "representation_provenance_class TEXT)"
                 )
                 connection.executemany(
@@ -847,17 +847,49 @@ class CohortBuilderDataTests(unittest.TestCase):
                 )
 
                 connection.execute(
+                    "CREATE INDEX locations_asset ON public_non_dicom_locations(asset_id)"
+                )
+                connection.executemany(
+                    "INSERT INTO public_non_dicom_locations VALUES (?,?,?)",
+                    [(f"other-{i}", "asset2", "submitted_original") for i in range(1000)],
+                )
+                connection.execute(
                     "CREATE VIEW agent_public_non_dicom_locations AS "
-                    "SELECT * FROM public_non_dicom_locations"
+                    "SELECT l.*, a.short_title FROM public_non_dicom_locations l "
+                    "JOIN public_non_dicom_assets a USING(asset_id)"
                 )
                 connection.execute(
                     "CREATE VIEW agent_public_non_dicom_assets AS "
                     "SELECT *, stored_url AS source_url FROM public_non_dicom_assets"
                 )
 
-            result = load_patient_public_non_dicom(path, "TEST", "P1")
+            import cohort_builder_data as data
+            original_read_sql = data.read_sql
+            query_plans = []
+
+            def read_with_plan(database, query, params=()):
+                if "FROM agent_public_non_dicom_asset_participants" in query:
+                    with sqlite3.connect(database) as connection:
+                        query_plans.extend(
+                            row[3] for row in connection.execute(
+                                "EXPLAIN QUERY PLAN " + query, params
+                            )
+                        )
+                return original_read_sql(database, query, params)
+
+            with mock.patch("cohort_builder_data.read_sql", side_effect=read_with_plan):
+                result = load_patient_public_non_dicom(path, "TEST", "P1")
+            self.assertTrue(query_plans)
+            self.assertFalse(any(
+                "MATERIALIZE agent_public_non_dicom_locations" in plan
+                for plan in query_plans
+            ), query_plans)
             self.assertEqual(len(result), 1)
             self.assertEqual(int(result.iloc[0]["location_count"]), 2)
+            self.assertEqual(
+                set(result.iloc[0]["available_representations"].split(",")),
+                {"submitted_original", "standardized_representation"},
+            )
             dicom = load_patient_public_non_dicom(
                 path, "TEST", "P1", include_dicom=True
             )

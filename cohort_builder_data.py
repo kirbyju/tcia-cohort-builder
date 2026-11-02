@@ -2883,6 +2883,8 @@ def load_patient_public_non_dicom(
         if has_geometry_assessments
         else "0"
     )
+    # Correlate location summaries to the selected assets. An outer join to
+    # the joined location view can materialize the archive-wide location list.
     return read_sql(
         path,
         f"""
@@ -2898,16 +2900,17 @@ def load_patient_public_non_dicom(
                a.participant_link_status, a.representation_provenance_class,
                a.source_system, a.source_url, a.quality_flag_json,
                ap.raw_subject_id, ap.subject_id_namespace, ap.link_status,
-               COUNT(DISTINCT l.location_id) AS location_count,
-               group_concat(DISTINCT l.representation_provenance_class)
-                 AS available_representations
+               (SELECT COUNT(DISTINCT l.location_id)
+                  FROM agent_public_non_dicom_locations l
+                 WHERE l.asset_id = a.asset_id) AS location_count,
+               (SELECT group_concat(DISTINCT l.representation_provenance_class)
+                  FROM agent_public_non_dicom_locations l
+                 WHERE l.asset_id = a.asset_id) AS available_representations
         FROM agent_public_non_dicom_asset_participants ap
         JOIN agent_public_non_dicom_assets a USING(asset_id)
-        LEFT JOIN agent_public_non_dicom_locations l USING(asset_id)
         WHERE a.short_title = ?
           AND ap.subject_id = ?
           AND {format_predicate}
-        GROUP BY a.asset_id, ap.asset_participant_id
         ORDER BY lower(COALESCE(a.file_name, a.asset_name, a.asset_id))
         """,
         (short_title, subject_id),
