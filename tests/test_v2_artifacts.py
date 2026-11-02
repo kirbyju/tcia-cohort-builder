@@ -62,6 +62,17 @@ def write_install(cache: Path, bundle: dict, installed_assets=None):
 
 
 class V2ArtifactCacheTests(unittest.TestCase):
+    def test_compact_component_versions_are_accepted(self):
+        for name, version, profile in [
+            ("snapshot", 9, "research_core"),
+            ("controlled_access", 3, "research_detail"),
+            ("public_non_dicom", 9, "research_detail"),
+        ]:
+            with self.subTest(component=name):
+                _validate_component_contract(name, {"schema_version": version, "profile": profile})
+                with self.assertRaisesRegex(RuntimeError, "Unsupported"):
+                    _validate_component_contract(name, {"schema_version": 999, "profile": profile})
+
     def test_snapshot_schema_eight_is_accepted(self):
         _validate_component_contract(
             "snapshot",

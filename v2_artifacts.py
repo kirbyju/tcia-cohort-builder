@@ -25,13 +25,13 @@ INSTALL_STATE_ASSET = "tcia_metadata_v2_install.json"
 SUPPORTED_BUNDLE_SCHEMA_VERSIONS = {2, 3}
 SUPPORTED_RELEASE_CONTRACTS = {"full", "streamlined"}
 SUPPORTED_COMPONENTS = {
-    "snapshot": {"schema_versions": {7, 8}, "profile": "research_core"},
+    "snapshot": {"schema_versions": {7, 8, 9}, "profile": "research_core"},
     "participant_inventory": {
         "schema_versions": {6, 7, 8, 10},
         "profile": "research_core",
     },
-    "public_non_dicom": {"schema_versions": {7, 8}, "profile": "research_detail"},
-    "controlled_access": {"schema_versions": {2}, "profile": "research_detail"},
+    "public_non_dicom": {"schema_versions": {7, 8, 9}, "profile": "research_detail"},
+    "controlled_access": {"schema_versions": {2, 3}, "profile": "research_detail"},
     "clinical": {"schema_versions": {17, 18}, "profile": "research_detail"},
 }
 SUPPORTED_INSTALL_PROFILES = {"research_core", "research_detail", "audit_support"}

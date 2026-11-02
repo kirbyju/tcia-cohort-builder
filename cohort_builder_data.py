@@ -2859,7 +2859,7 @@ def load_patient_public_non_dicom(
     asset_columns = set(
         read_sql(
             path,
-            "SELECT name FROM pragma_table_info('public_non_dicom_assets')",
+            "SELECT name FROM pragma_table_info('agent_public_non_dicom_assets')",
         ).get("name", pd.Series(dtype=str)).astype(str)
     )
     geometry_status_sql = (
@@ -2867,17 +2867,17 @@ def load_patient_public_non_dicom(
     )
     download_id_sql = "a.download_id" if "download_id" in asset_columns else "''"
     has_geometry_assessments = (
-        "public_non_dicom_geometry_assessments" in sqlite_objects(path)
+        "agent_public_non_dicom_geometry_status" in sqlite_objects(path)
     )
     regular_count_sql = (
-        "(SELECT COUNT(*) FROM public_non_dicom_geometry_assessments g "
+        "(SELECT COUNT(*) FROM agent_public_non_dicom_geometry_status g "
         "WHERE g.asset_id = a.asset_id "
         "AND g.geometry_status = 'checked_grid_geometry')"
         if has_geometry_assessments
         else "0"
     )
     irregular_count_sql = (
-        "(SELECT COUNT(*) FROM public_non_dicom_geometry_assessments g "
+        "(SELECT COUNT(*) FROM agent_public_non_dicom_geometry_status g "
         "WHERE g.asset_id = a.asset_id "
         "AND g.geometry_status = 'checked_invalid_geometry')"
         if has_geometry_assessments
@@ -2901,9 +2901,9 @@ def load_patient_public_non_dicom(
                COUNT(DISTINCT l.location_id) AS location_count,
                group_concat(DISTINCT l.representation_provenance_class)
                  AS available_representations
-        FROM public_non_dicom_asset_participants ap
-        JOIN public_non_dicom_assets a USING(asset_id)
-        LEFT JOIN public_non_dicom_locations l USING(asset_id)
+        FROM agent_public_non_dicom_asset_participants ap
+        JOIN agent_public_non_dicom_assets a USING(asset_id)
+        LEFT JOIN agent_public_non_dicom_locations l USING(asset_id)
         WHERE a.short_title = ?
           AND ap.subject_id = ?
           AND {format_predicate}
@@ -3337,11 +3337,11 @@ def _read_public_participant_export_rows(
     if not short_titles or "agent_public_non_dicom_asset_participants" not in objects:
         return pd.DataFrame()
     placeholders = ",".join("?" for _ in short_titles)
-    if "public_non_dicom_assets" in objects:
+    if "agent_public_non_dicom_assets" in objects:
         asset_columns = set(
             read_sql(
                 path,
-                "SELECT name FROM pragma_table_info('public_non_dicom_assets')",
+                "SELECT name FROM pragma_table_info('agent_public_non_dicom_assets')",
             ).get("name", pd.Series(dtype=str)).astype(str)
         )
 
@@ -3384,7 +3384,7 @@ def _read_public_participant_export_rows(
                    {asset_expr('source_url')} AS package_url,
                    '' AS body_part_examined
             FROM agent_public_non_dicom_asset_participants ap
-            JOIN public_non_dicom_assets a USING(asset_id)
+            JOIN agent_public_non_dicom_assets a USING(asset_id)
             WHERE ap.short_title IN ({placeholders})
             """,
             tuple(short_titles),

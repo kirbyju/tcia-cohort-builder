@@ -813,7 +813,7 @@ class CohortBuilderDataTests(unittest.TestCase):
                     "asset_name TEXT, file_name TEXT, package_path TEXT, file_format TEXT, media_kind TEXT, "
                     "imaging_domain TEXT, modality TEXT, object_role TEXT, represented_file_count INTEGER, size_bytes INTEGER, "
                     "participant_link_status TEXT, representation_provenance_class TEXT, source_system TEXT, "
-                    "source_url TEXT, quality_flag_json TEXT)"
+                    "stored_url TEXT, quality_flag_json TEXT)"
                 )
                 connection.executemany(
                     "INSERT INTO public_non_dicom_assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -844,6 +844,15 @@ class CohortBuilderDataTests(unittest.TestCase):
                 connection.execute(
                     "CREATE VIEW agent_public_non_dicom_asset_participants AS "
                     "SELECT * FROM public_non_dicom_asset_participants"
+                )
+
+                connection.execute(
+                    "CREATE VIEW agent_public_non_dicom_locations AS "
+                    "SELECT * FROM public_non_dicom_locations"
+                )
+                connection.execute(
+                    "CREATE VIEW agent_public_non_dicom_assets AS "
+                    "SELECT *, stored_url AS source_url FROM public_non_dicom_assets"
                 )
 
             result = load_patient_public_non_dicom(path, "TEST", "P1")
