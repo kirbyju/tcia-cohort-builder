@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -11,6 +12,54 @@ class UpdateServerContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.script = (ROOT / "update_server.sh").read_text(encoding="utf-8")
+
+    def run_heartbeat_fixture(self, body: str) -> subprocess.CompletedProcess[str]:
+        functions = self.script[
+            self.script.index("stop_heartbeat() {"):self.script.index("cleanup() {")
+        ]
+        return subprocess.run(
+            ["bash", "-c", """
+set -Eeuo pipefail
+HEARTBEAT_PID=""
+PROGRESS_HEARTBEAT_SECONDS=0.01
+NEW_INSTALL_DIR=/nonexistent-heartbeat-fixture
+trap 'printf "DEPLOYMENT_ERROR\\n" >&2' ERR
+trap 'printf "DEPLOYMENT_CLEANUP\\n" >&2' EXIT
+log() { printf '%s\\n' "$*"; }
+""" + functions + body],
+            capture_output=True, text=True, timeout=5,
+        )
+
+    def test_heartbeat_sigpipe_does_not_report_deployment_failure(self) -> None:
+        result = self.run_heartbeat_fixture("""
+date() { return 141; }
+run_with_heartbeat fixture sleep 0.1
+printf 'INSTALL_SUCCEEDED\\n'
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("INSTALL_SUCCEEDED", result.stdout)
+        self.assertNotIn("DEPLOYMENT_ERROR", result.stderr)
+        self.assertEqual(result.stderr.count("DEPLOYMENT_CLEANUP"), 1)
+
+    def test_stopping_heartbeat_during_date_keeps_deployment_successful(self) -> None:
+        result = self.run_heartbeat_fixture("""
+date() { sleep 0.1; printf '100'; }
+run_with_heartbeat fixture sleep 0.03
+printf 'INSTALL_SUCCEEDED\\n'
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("INSTALL_SUCCEEDED", result.stdout)
+        self.assertNotIn("DEPLOYMENT_ERROR", result.stderr)
+        self.assertEqual(result.stderr.count("DEPLOYMENT_CLEANUP"), 1)
+
+    def test_real_install_failure_still_reaches_deployment_handler(self) -> None:
+        result = self.run_heartbeat_fixture("""
+date() { printf '100'; }
+run_with_heartbeat fixture bash -c 'exit 7'
+""")
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertIn("DEPLOYMENT_ERROR", result.stderr)
+        self.assertEqual(result.stderr.count("DEPLOYMENT_CLEANUP"), 1)
 
     def test_public_script_has_no_host_specific_defaults(self) -> None:
         self.assertNotIn("/home/exouser", self.script)

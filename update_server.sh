@@ -114,6 +114,11 @@ stop_heartbeat() {
 start_heartbeat() {
   local label=$1
   (
+    # Progress is best-effort. Never let this worker or its command
+    # substitutions run the deployment's error/cleanup handlers. Stopping the
+    # worker can close a pipe while a short-lived child is still writing.
+    trap - ERR EXIT
+    trap 'exit 0' TERM PIPE
     local started now stage_dir stage_size stage_file stage_file_size progress_detail
     started="$(date +%s)"
     while sleep "$PROGRESS_HEARTBEAT_SECONDS"; do
