@@ -144,6 +144,17 @@ bundle when its fingerprint matches the stable release, validates candidate
 service compatibility, switches atomically when necessary, restarts all three
 services, and verifies local/public health, readiness, MCP, and bundle state.
 
+During bundle installation, the heartbeat locates the candidate's nested
+`generations/.tcia-v2-stage-*` directory. The query-skill installer also reports
+per-asset download, decompression, integrity, and foreign-key check timings to
+stderr. A full SQLite scan can leave the staged file size unchanged.
+
+The SQLite verification optimization lives in the query-skill repository's
+`scripts/tcia_v2_bundle.py`; pulling only this repository does not update the
+installer. The normal updater advances both checkouts. Keep server settings in
+the protected environment file, and use a private launcher that executes this
+tracked updater rather than keeping a separate copy of the deployment logic.
+
 For a code- or dependency-only release that does not change metadata artifacts,
 use `--code-only`. It requires and validates the existing active
 `research_detail` installation, performs no bundle-manifest fetch, artifact

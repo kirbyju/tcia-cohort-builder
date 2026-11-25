@@ -119,7 +119,7 @@ start_heartbeat() {
     while sleep "$PROGRESS_HEARTBEAT_SECONDS"; do
       now="$(date +%s)"
       progress_detail=""
-      stage_dir="$(find "$RELEASES_ROOT" -maxdepth 1 -type d -name '.tcia-v2-stage-*' -printf '%T@\t%p\n' 2>/dev/null | sort -nr | head -n 1 | cut -f 2- || true)"
+      stage_dir="$(find "$NEW_INSTALL_DIR/generations" -maxdepth 1 -type d -name '.tcia-v2-stage-*' -printf '%T@\t%p\n' 2>/dev/null | sort -nr | head -n 1 | cut -f 2- || true)"
       if [[ -n "$stage_dir" ]]; then
         stage_size="$(du -sh "$stage_dir" 2>/dev/null | awk '{print $1}' || true)"
         stage_file="$(find "$stage_dir" -maxdepth 1 -type f -printf '%T@\t%f\t%s\n' 2>/dev/null | sort -nr | head -n 1 || true)"
